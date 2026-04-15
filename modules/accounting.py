@@ -342,6 +342,10 @@ class AccountingMigrator:
                     if fld in src_cols and fld in tgt_cols:
                         rec[fld] = j.get(fld)
 
+                # use_documents: forzar True en diarios de venta (localización CL)
+                if 'use_documents' in tgt_cols and j.get('type') == 'sale':
+                    rec['use_documents'] = True
+
                 # Campos NOT NULL nuevos en Odoo 16 que no existen en Odoo 12
                 journal_not_null_defaults = {
                     'invoice_reference_type':  'invoice',
@@ -390,7 +394,48 @@ class AccountingMigrator:
         """
         log.info("Migrando facturas (account_invoice -> account_move)...")
 
-        invoices = self.b.fetch_src("""
+        # Detectar columnas disponibles antes de construir el SELECT
+        src_inv_cols = self.b.get_src_columns('account_invoice')
+        self.b.id_map.setdefault('account_invoice', {})
+        self.b.id_map.setdefault('account_move', {})
+        tgt_move_cols = self.b.get_tgt_columns('account_move')
+
+        # ── Campos SII / l10n_cl ──────────────────────────────────────────
+        # Plain (char, text, int, xml, etc.): se copian directamente si el
+        # nombre de columna coincide en origen y destino.
+        sii_plain_cols = [
+            c for c in src_inv_cols
+            if (c.startswith('sii_') or c.startswith('l10n_cl_'))
+            and not c.endswith('_id')
+            and c in tgt_move_cols
+        ]
+        # FK cuyo nombre coincide en src y tgt (p.ej. sii_xml_request_id)
+        sii_fk_cols = [
+            c for c in src_inv_cols
+            if (c.startswith('sii_') or c.startswith('l10n_cl_'))
+            and c.endswith('_id')
+            and c in tgt_move_cols
+        ]
+        # document_class_id: FK especial de la localización chilena
+        has_doc_class = (
+            'document_class_id' in src_inv_cols
+            and 'document_class_id' in tgt_move_cols
+        )
+        doc_class_id_map = self._build_sii_doc_class_map() if has_doc_class else {}
+
+        if sii_plain_cols:
+            log.info("Campos SII plain detectados para migrar: %s", sii_plain_cols)
+        if sii_fk_cols or has_doc_class:
+            log.info("Campos SII FK detectados para migrar: %s%s",
+                     sii_fk_cols, ' + document_class_id' if has_doc_class else '')
+
+        # SELECT dinámico: añadir columnas SII al final
+        _sii_parts = ['ai.' + c for c in sii_plain_cols + sii_fk_cols]
+        if has_doc_class:
+            _sii_parts.append('ai.document_class_id')
+        _sii_select = (',\n                ' + ',\n                '.join(_sii_parts)) if _sii_parts else ''
+
+        invoices = self.b.fetch_src(f"""
             SELECT
                 ai.id                       AS inv_id,
                 ai.type                     AS move_type,
@@ -416,14 +461,11 @@ class AccountingMigrator:
                 am.date,
                 am.name                     AS move_name_journal,
                 am.ref                      AS move_ref
+                {_sii_select}
             FROM account_invoice ai
             LEFT JOIN account_move am ON am.id = ai.move_id
             ORDER BY ai.id
         """)
-
-        self.b.id_map.setdefault('account_invoice', {})
-        self.b.id_map.setdefault('account_move', {})
-        tgt_move_cols = self.b.get_tgt_columns('account_move')
 
         inserted = 0
         with self.b.tgt_conn.cursor() as cur:
@@ -484,6 +526,35 @@ class AccountingMigrator:
                 if 'auto_post' in tgt_move_cols:
                     rec['auto_post'] = 'no'
 
+                # use_documents: True para facturas/NC de venta (localización CL)
+                if 'use_documents' in tgt_move_cols:
+                    rec['use_documents'] = (inv['move_type'] or '') in ('out_invoice', 'out_refund')
+
+                # ── Campos SII plain (copiar valor directamente) ──────────
+                for _c in sii_plain_cols:
+                    _v = inv.get(_c)
+                    if _v is not None:
+                        rec[_c] = _v
+
+                # ── Campos SII FK (mapear ID o copiar directamente) ───────
+                for _c in sii_fk_cols:
+                    _old_id = inv.get(_c)
+                    if _old_id:
+                        # Intentar via id_map usando el nombre de tabla sin '_id'
+                        _ref = _c[:-3]
+                        rec[_c] = self.b.id_map.get(_ref, {}).get(_old_id, _old_id)
+
+                # ── document_class_id ─────────────────────────────────────
+                if has_doc_class:
+                    _dc_id = inv.get('document_class_id')
+                    if _dc_id:
+                        if doc_class_id_map:
+                            rec['document_class_id'] = doc_class_id_map.get(_dc_id)
+                        else:
+                            # Sin mapa: copiar el ID directamente
+                            # (asume que los mismos registros existen en destino)
+                            rec['document_class_id'] = _dc_id
+
                 # Filtrar solo los que existen en destino
                 rec = {k: v for k, v in rec.items() if k in tgt_move_cols}
 
@@ -505,6 +576,55 @@ class AccountingMigrator:
                     log.error("account_invoice old_id=%s: %s", old_inv_id, e)
 
         log.info("account_invoice->account_move: %d facturas migradas.", inserted)
+
+    def _build_sii_doc_class_map(self) -> dict:
+        """
+        Construye {old_sii_document_class_id -> new_sii_document_class_id}
+        haciendo match por código (sii_code > code > name) entre origen y destino.
+        Si la tabla no existe en destino retorna {} y document_class_id
+        se copiará directamente como fallback.
+        """
+        if not self.b.table_exists_in_src('sii_document_class'):
+            return {}
+
+        src_cols = self.b.get_src_columns('sii_document_class')
+        code_col = next(
+            (c for c in ('sii_code', 'code', 'name') if c in src_cols), None
+        )
+        if not code_col:
+            log.warning("sii_document_class: sin columna de código; se copiará document_class_id directamente.")
+            return {}
+
+        # Verificar existencia en destino
+        with self.b.tgt_conn.cursor() as cur:
+            cur.execute("""
+                SELECT EXISTS(
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_name = 'sii_document_class' AND table_schema = 'public'
+                )
+            """)
+            if not cur.fetchone()[0]:
+                log.warning("sii_document_class no existe en destino; document_class_id se copiará directamente.")
+                return {}
+
+        src_rows = self.b.fetch_src(
+            f'SELECT id, "{code_col}" AS code FROM sii_document_class'
+        )
+        tgt_map = {}
+        with self.b.tgt_conn.cursor() as cur:
+            cur.execute(f'SELECT id, "{code_col}" FROM sii_document_class')
+            for tid, code in cur.fetchall():
+                if code is not None:
+                    tgt_map[str(code)] = tid
+
+        result = {}
+        for row in src_rows:
+            key = str(row['code']) if row['code'] is not None else None
+            if key and key in tgt_map:
+                result[row['id']] = tgt_map[key]
+
+        log.info("sii_document_class: %d/%d registros mapeados.", len(result), len(src_rows))
+        return result
 
     # ──────────────────────────────────────────────
     # 5. Asientos no-factura: account_move 'entry'
@@ -704,6 +824,17 @@ class AccountingMigrator:
                         rec.get('company_id'), next(iter(company_currency_map.values()), None)
                     )
 
+                # En Odoo 12, amount_currency = 0 para líneas en moneda local.
+                # En Odoo 16, _compute_amount() usa amount_currency para calcular
+                # amount_tax / amount_untaxed / amount_total, por lo que debe
+                # coincidir con balance (debit - credit) cuando la línea está en
+                # moneda de empresa.
+                if 'amount_currency' in tgt_cols and not rec.get('amount_currency'):
+                    _bal = float(rec.get('balance') or 0.0)
+                    if not _bal:
+                        _bal = float(rec.get('debit') or 0.0) - float(rec.get('credit') or 0.0)
+                    rec['amount_currency'] = _bal
+
                 # Rellenar NOT NULL
                 self.b._fill_not_null(rec, tgt_cols)
 
@@ -833,7 +964,9 @@ class AccountingMigrator:
                     else False
                 )
                 if display_type not in ('line_section', 'line_note'):
-                    display_type = False   # línea de producto estándar
+                    # Odoo 16 requiere 'product' (no False/NULL) para que la línea
+                    # aparezca en invoice_line_ids (domain: display_type IN ('product',...))
+                    display_type = 'product'
 
                 # Calcular balance / debit / credit a partir del importe y tipo de factura
                 price_subtotal = float(line.get('price_subtotal') or 0.0)
@@ -1108,3 +1241,106 @@ class AccountingMigrator:
                     except Exception:
                         self.b.tgt_conn.rollback()
             log.info("account_move_line full_reconcile_id actualizados: %d", updated_fr)
+
+        # Recalcular importes del encabezado de facturas (campos computed+stored)
+        self.recompute_move_amounts()
+
+    def recompute_move_amounts(self):
+        """
+        Recalcula via SQL puro los campos computed+stored de account_move que
+        Odoo 16 no rellena al insertar por bypass del ORM:
+
+          amount_untaxed      = suma subtotales de líneas de producto
+          amount_tax          = suma de líneas de impuesto (amount_currency)
+          amount_total        = amount_untaxed + amount_tax
+          amount_untaxed_signed  = ±amount_untaxed según move_type
+          amount_total_signed    = ±amount_total  según move_type
+          amount_residual        = amount_total  (solo facturas no pagadas)
+          amount_residual_signed = ±amount_residual
+
+        Solo actúa sobre los account_move migrados (filtra por ids del id_map).
+        """
+        log.info("Recalculando importes de account_move (amount_untaxed_signed, etc.)...")
+
+        # IDs de moves migrados (los de facturas + los de asientos puros)
+        all_new_move_ids = list(set(
+            list(self.b.id_map.get('account_invoice', {}).values()) +
+            list(self.b.id_map.get('account_move', {}).values())
+        ))
+        if not all_new_move_ids:
+            log.warning("recompute_move_amounts: sin moves mapeados, saltando.")
+            return
+
+        tgt_move_cols = self.b.get_tgt_columns('account_move')
+
+        # ── Detectar qué campos existen en el destino ────────────────────
+        has = lambda c: c in tgt_move_cols  # noqa: E731
+
+        with self.b.tgt_conn.cursor() as cur:
+            # 1. Calcular importes por move desde las líneas
+            #    - líneas de producto (display_type IN ('product', False, NULL)):
+            #      price_subtotal -> amount_untaxed
+            #    - líneas de impuesto (display_type = 'tax'):
+            #      amount_currency -> amount_tax
+            cur.execute("""
+                CREATE TEMP TABLE _move_amounts AS
+                SELECT
+                    aml.move_id,
+                    SUM(CASE
+                        WHEN aml.display_type IN ('product') OR aml.display_type IS NULL OR aml.display_type = FALSE::text
+                        THEN ABS(aml.price_subtotal)
+                        ELSE 0
+                    END) AS untaxed,
+                    SUM(CASE
+                        WHEN aml.display_type = 'tax'
+                        THEN ABS(aml.amount_currency)
+                        ELSE 0
+                    END) AS tax
+                FROM account_move_line aml
+                WHERE aml.move_id = ANY(%s)
+                GROUP BY aml.move_id
+            """, (all_new_move_ids,))
+
+            # 2. UPDATE account_move con los importes calculados
+            update_parts = ["amount_untaxed = ma.untaxed",
+                            "amount_tax = ma.tax",
+                            "amount_total = ma.untaxed + ma.tax"]
+
+            if has('amount_untaxed_signed'):
+                update_parts.append(
+                    "amount_untaxed_signed = CASE "
+                    "WHEN am.move_type IN ('out_refund','in_refund') THEN -(ma.untaxed) "
+                    "ELSE ma.untaxed END"
+                )
+            if has('amount_total_signed'):
+                update_parts.append(
+                    "amount_total_signed = CASE "
+                    "WHEN am.move_type IN ('out_refund','in_refund') THEN -(ma.untaxed + ma.tax) "
+                    "ELSE (ma.untaxed + ma.tax) END"
+                )
+            if has('amount_residual'):
+                update_parts.append(
+                    "amount_residual = CASE "
+                    "WHEN am.payment_state IN ('paid','in_payment') THEN 0 "
+                    "ELSE (ma.untaxed + ma.tax) END"
+                )
+            if has('amount_residual_signed'):
+                update_parts.append(
+                    "amount_residual_signed = CASE "
+                    "WHEN am.payment_state IN ('paid','in_payment') THEN 0 "
+                    "WHEN am.move_type IN ('out_refund','in_refund') "
+                    "  THEN -(ma.untaxed + ma.tax) "
+                    "ELSE (ma.untaxed + ma.tax) END"
+                )
+
+            sql = (
+                "UPDATE account_move am "
+                "SET " + ", ".join(update_parts) + " "
+                "FROM _move_amounts ma "
+                "WHERE am.id = ma.move_id"
+            )
+            cur.execute(sql)
+            updated = cur.rowcount
+            cur.execute("DROP TABLE IF EXISTS _move_amounts")
+
+        log.info("account_move: %d registros con importes recalculados.", updated)

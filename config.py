@@ -19,7 +19,7 @@ SOURCE_DB = {
 # ─────────────────────────────────────────────
 TARGET_DB = {
     'dbname': 'clicksale',
-    'user': 'postgres',
+    'user': 'odoo',
     'password': '2010',
     'host': 'localhost',
     'port': '5432',
@@ -117,7 +117,12 @@ TABLES_TO_CLEAN = [
     'stock_picking_type',
     'stock_warehouse',
     'stock_location',
+    'ir_sequence_date_range',
     'ir_sequence',
+    'dte_caf',
+    'l10n_cl_dte_caf',
+    'sii_firma',
+    'l10n_cl_certificate',
     'account_tax_repartition_line',
     'account_tax',
     'account_journal',

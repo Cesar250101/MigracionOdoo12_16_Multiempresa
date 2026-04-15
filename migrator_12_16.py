@@ -383,8 +383,218 @@ class Migrator12to16:
         )
 
     # ──────────────────────────────────────────────
-    # Orquestación principal
+    # Secuencias
     # ──────────────────────────────────────────────
+
+    def migrate_sequences(self):
+        """
+        Migra ir.sequence y su sub-tabla ir.sequence.date.range.
+        Reemplaza el migrate_table genérico para incluir la sub-tabla
+        y omitir campos que no existen en Odoo 16.
+        """
+        log.info("=== Migrando secuencias (ir_sequence) ===")
+
+        src_seq_cols = self.base.get_src_columns('ir_sequence')
+        skip_seq = {'message_main_attachment_id'}
+        # 'date_range_ids' es campo virtual en Odoo 12; en DB es la FK inversa
+        skip_seq |= {c for c in src_seq_cols if c not in self.base.get_tgt_columns('ir_sequence')}
+
+        self.base.migrate_table(
+            'ir_sequence',
+            skip_fields=list(skip_seq),
+        )
+
+        # Sub-tabla: rangos de fecha de secuencias (Odoo 12 con use_date_range)
+        if self.base.table_exists_in_src('ir_sequence_date_range') and \
+                self.base.table_exists_in_tgt('ir_sequence_date_range'):
+            self.base.migrate_table(
+                'ir_sequence_date_range',
+                mapping_fields={'sequence_id': 'ir_sequence'},
+            )
+
+    # ──────────────────────────────────────────────
+    # CAF localización chilena (dte.caf)
+    # ──────────────────────────────────────────────
+
+    def migrate_dte_caf(self):
+        """
+        Migra la tabla dte.caf (Código de Autorización de Folios) de la
+        localización chilena. Detecta automáticamente el nombre de tabla tanto
+        en origen como en destino (dte_caf / l10n_cl_dte_caf).
+        """
+        log.info("=== Migrando CAF (dte.caf) ===")
+
+        # Detectar nombre de tabla en origen
+        src_table = None
+        for candidate in ('dte_caf', 'l10n_cl_dte_caf'):
+            if self.base.table_exists_in_src(candidate):
+                src_table = candidate
+                break
+        if not src_table:
+            log.warning("dte.caf: tabla no encontrada en origen (dte_caf / l10n_cl_dte_caf), saltando.")
+            return
+
+        # Detectar nombre de tabla en destino
+        tgt_table = None
+        for candidate in ('dte_caf', 'l10n_cl_dte_caf'):
+            if self.base.table_exists_in_tgt(candidate):
+                tgt_table = candidate
+                break
+        if not tgt_table:
+            log.warning("dte.caf: tabla no encontrada en destino, saltando.")
+            return
+
+        log.info("dte.caf: origen=%s  destino=%s", src_table, tgt_table)
+
+        src_cols = self.base.get_src_columns(src_table)
+        tgt_cols = self.base.get_tgt_columns(tgt_table)
+
+        # Construir mapa document_class_id a través de código SII
+        doc_class_map = self.accounting._build_sii_doc_class_map()
+
+        rows = self.base.fetch_src(f'SELECT * FROM "{src_table}" ORDER BY id')
+        self.base.id_map.setdefault(src_table, {})
+        self.base.id_map.setdefault(tgt_table, {})
+
+        # Campos a omitir: los que no existen en destino o son computados
+        skip = {'id', 'message_main_attachment_id'}
+
+        inserted = 0
+        with self.tgt_conn.cursor() as cur:
+            for row in rows:
+                old_id = row['id']
+                rec = {}
+
+                for col in src_cols:
+                    if col in skip or col not in tgt_cols:
+                        continue
+                    rec[col] = row[col]
+
+                # ── FKs ──────────────────────────────────────────────────
+                rec['company_id'] = self.base.map_company(row.get('company_id'))
+
+                if 'journal_id' in src_cols and 'journal_id' in tgt_cols:
+                    rec['journal_id'] = self.base.id_map.get('account_journal', {}).get(
+                        row.get('journal_id'))
+
+                if 'sequence_id' in src_cols and 'sequence_id' in tgt_cols:
+                    rec['sequence_id'] = self.base.id_map.get('ir_sequence', {}).get(
+                        row.get('sequence_id'), row.get('sequence_id'))
+
+                if 'document_class_id' in src_cols and 'document_class_id' in tgt_cols:
+                    old_dc = row.get('document_class_id')
+                    if old_dc:
+                        rec['document_class_id'] = doc_class_map.get(old_dc, old_dc) \
+                            if doc_class_map else old_dc
+
+                # ── Limpiar FK = 0 ────────────────────────────────────────
+                for f in list(rec.keys()):
+                    if f.endswith('_id') and rec[f] == 0:
+                        rec[f] = None
+
+                rec['create_uid'] = 1
+                rec['write_uid'] = 1
+
+                self.base._fill_not_null(rec, tgt_cols)
+
+                cols_q = ', '.join(f'"{c}"' for c in rec)
+                placeholders = ', '.join(['%s'] * len(rec))
+                try:
+                    cur.execute(
+                        f'INSERT INTO "{tgt_table}" ({cols_q}) VALUES ({placeholders}) RETURNING id',
+                        self.base.prepare_vals(rec, tgt_cols),
+                    )
+                    new_id = cur.fetchone()[0]
+                    self.base.id_map[src_table][old_id] = new_id
+                    if src_table != tgt_table:
+                        self.base.id_map[tgt_table][old_id] = new_id
+                    inserted += 1
+                except Exception as e:
+                    self.tgt_conn.rollback()
+                    log.error("dte_caf old_id=%s: %s", old_id, e)
+
+        log.info("dte_caf: %d registros migrados.", inserted)
+
+    def migrate_sii_firma(self):
+        """
+        Migra la tabla sii.firma (certificado digital para firma electrónica).
+        Detecta automáticamente el nombre de tabla en origen y destino
+        (sii_firma / l10n_cl_certificate).
+        """
+        log.info("=== Migrando sii.firma ===")
+
+        # Detectar tabla en origen
+        src_table = None
+        for candidate in ('sii_firma', 'l10n_cl_certificate'):
+            if self.base.table_exists_in_src(candidate):
+                src_table = candidate
+                break
+        if not src_table:
+            log.warning("sii.firma: tabla no encontrada en origen (sii_firma / l10n_cl_certificate), saltando.")
+            return
+
+        # Detectar tabla en destino
+        tgt_table = None
+        for candidate in ('sii_firma', 'l10n_cl_certificate'):
+            if self.base.table_exists_in_tgt(candidate):
+                tgt_table = candidate
+                break
+        if not tgt_table:
+            log.warning("sii.firma: tabla no encontrada en destino, saltando.")
+            return
+
+        log.info("sii.firma: origen=%s  destino=%s", src_table, tgt_table)
+
+        src_cols = self.base.get_src_columns(src_table)
+        tgt_cols = self.base.get_tgt_columns(tgt_table)
+
+        rows = self.base.fetch_src(f'SELECT * FROM "{src_table}" ORDER BY id')
+        self.base.id_map.setdefault(src_table, {})
+        if src_table != tgt_table:
+            self.base.id_map.setdefault(tgt_table, {})
+
+        skip = {'id', 'message_main_attachment_id'}
+        inserted = 0
+
+        with self.tgt_conn.cursor() as cur:
+            for row in rows:
+                old_id = row['id']
+                rec = {}
+
+                for col in src_cols:
+                    if col in skip or col not in tgt_cols:
+                        continue
+                    rec[col] = row[col]
+
+                rec['company_id'] = self.base.map_company(row.get('company_id'))
+
+                # Limpiar FK = 0
+                for f in list(rec.keys()):
+                    if f.endswith('_id') and rec[f] == 0:
+                        rec[f] = None
+
+                rec['create_uid'] = 1
+                rec['write_uid'] = 1
+
+                self.base._fill_not_null(rec, tgt_cols)
+
+                cols_q = ', '.join(f'"{c}"' for c in rec)
+                placeholders = ', '.join(['%s'] * len(rec))
+                try:
+                    cur.execute(
+                        f'INSERT INTO "{tgt_table}" ({cols_q}) VALUES ({placeholders}) RETURNING id',
+                        self.base.prepare_vals(rec, tgt_cols),
+                    )
+                    new_id = cur.fetchone()[0]
+                    self.base.id_map[src_table][old_id] = new_id
+                    if src_table != tgt_table:
+                        self.base.id_map[tgt_table][old_id] = new_id
+                    inserted += 1
+                except Exception as e:
+                    self.tgt_conn.rollback()
+                    log.error("sii_firma old_id=%s: %s", old_id, e)
+
+        log.info("sii_firma: %d registros migrados.", inserted)
 
     def run(self):
         """Ejecuta la migración completa en el orden correcto."""
@@ -414,8 +624,8 @@ class Migrator12to16:
             # 6. Diarios
             self.accounting.migrate_journals()
 
-            # 7. Secuencias (ir_sequence)
-            self.base.migrate_table('ir_sequence')
+            # 7. Secuencias (ir_sequence + ir_sequence_date_range)
+            self.migrate_sequences()
 
             # 8. Stock: ubicaciones, almacenes, tipos de operación
             self.stock.migrate_locations()
@@ -439,6 +649,10 @@ class Migrator12to16:
 
             # 12. Compras
             self.migrate_purchases()
+
+            # 12b. CAF y firma localización chilena
+            self.migrate_sii_firma()
+            self.migrate_dte_caf()
 
             # 13. Facturas (account_invoice -> account_move)
             self.accounting.migrate_invoices()
