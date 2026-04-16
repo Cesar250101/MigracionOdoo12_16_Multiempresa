@@ -412,6 +412,16 @@ class Migrator12to16:
                 mapping_fields={'sequence_id': 'ir_sequence'},
             )
 
+        # is_dte no existe en Odoo 12; activarlo en secuencias SII recién migradas
+        with self.tgt_conn.cursor() as cur:
+            cur.execute(
+                """UPDATE ir_sequence SET is_dte = TRUE
+                    WHERE sii_document_class_id IS NOT NULL
+                      AND (is_dte IS NULL OR is_dte = FALSE)"""
+            )
+            log.info("ir_sequence: is_dte=True aplicado a %d secuencias SII.", cur.rowcount)
+        self.tgt_conn.commit()
+
     # ──────────────────────────────────────────────
     # CAF localización chilena (dte.caf)
     # ──────────────────────────────────────────────
@@ -457,7 +467,8 @@ class Migrator12to16:
         self.base.id_map.setdefault(tgt_table, {})
 
         # Campos a omitir: los que no existen en destino o son computados
-        skip = {'id', 'message_main_attachment_id'}
+        skip = {'id', 'message_main_attachment_id', 'caf_file',
+                'sii_document_class', 'status'}
 
         inserted = 0
         with self.tgt_conn.cursor() as cur:
@@ -481,11 +492,20 @@ class Migrator12to16:
                     rec['sequence_id'] = self.base.id_map.get('ir_sequence', {}).get(
                         row.get('sequence_id'), row.get('sequence_id'))
 
-                if 'document_class_id' in src_cols and 'document_class_id' in tgt_cols:
-                    old_dc = row.get('document_class_id')
+                # sii_document_class (origen) → document_class_id (destino)
+                if 'sii_document_class' in src_cols and 'document_class_id' in tgt_cols:
+                    old_dc = row.get('sii_document_class')
                     if old_dc:
                         rec['document_class_id'] = doc_class_map.get(old_dc, old_dc) \
                             if doc_class_map else old_dc
+
+                # status (origen) → state (destino)
+                if 'status' in src_cols and 'state' in tgt_cols:
+                    status_map = {
+                        'draft': 'draft', 'in_use': 'in_use',
+                        'spent': 'spent', 'expired': 'expired',
+                    }
+                    rec['state'] = status_map.get(row.get('status'), row.get('status'))
 
                 # ── Limpiar FK = 0 ────────────────────────────────────────
                 for f in list(rec.keys()):
@@ -495,6 +515,188 @@ class Migrator12to16:
                 rec['create_uid'] = 1
                 rec['write_uid'] = 1
 
+                self.base._fill_not_null(rec, tgt_cols)
+
+                cols_q = ', '.join(f'"{c}"' for c in rec)
+                placeholders = ', '.join(['%s'] * len(rec))
+                try:
+                    cur.execute(
+                        f'INSERT INTO "{tgt_table}" ({cols_q}) VALUES ({placeholders}) RETURNING id',
+                        self.base.prepare_vals(rec, tgt_cols),
+                    )
+                    new_id = cur.fetchone()[0]
+                    self.base.id_map[src_table][old_id] = new_id
+                    if src_table != tgt_table:
+                        self.base.id_map[tgt_table][old_id] = new_id
+                    inserted += 1
+                except Exception as e:
+                    self.tgt_conn.rollback()
+                    log.error("dte_caf old_id=%s: %s", old_id, e)
+
+        log.info("dte_caf: %d registros migrados.", inserted)
+
+    def migrate_sii_sequences_and_caf(self):
+        """
+        (1) Renombra las ir.sequence SII del diario de facturas de clientes
+            añadiendo '-{target_company_id}' al nombre original para
+            diferenciarlas en un entorno multiempresa.
+        (2) Reconstruye el id_map de ir_sequence haciendo match por
+            sii_document_class_id entre origen y destino.
+        (3) Limpia y re-migra dte.caf (relación 1:N con ir.sequence),
+            manejando el cambio de nombre de columna
+            sii_document_class → document_class_id y status → state.
+        """
+        log.info("=== Migrando ir.sequence (SII) + dte.caf ===")
+
+        target_company_id = cfg.DEFAULT_TARGET_COMPANY_ID
+
+        # ── 1. Añadir sufijo al nombre de las SII sequences en destino ────────
+        with self.tgt_conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE ir_sequence
+                   SET name = name || %s
+                 WHERE sii_document_class_id IS NOT NULL
+                   AND company_id = %s
+                   AND name NOT LIKE %s
+                """,
+                (f'-{target_company_id}', target_company_id, f'%-{target_company_id}'),
+            )
+            updated = cur.rowcount
+        self.tgt_conn.commit()
+        log.info("ir_sequence SII: %d nombres actualizados con sufijo -%s.", updated, target_company_id)
+
+        # ── 2. Reconstruir id_map ir_sequence por sii_document_class_id ────────
+        src_sii_seqs = self.base.fetch_src(
+            "SELECT id, sii_document_class_id FROM ir_sequence "
+            "WHERE sii_document_class_id IS NOT NULL ORDER BY id"
+        )
+        doc_class_map = self.accounting._build_sii_doc_class_map()
+        self.base.id_map.setdefault('ir_sequence', {})
+
+        with self.tgt_conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT id, sii_document_class_id FROM ir_sequence "
+                "WHERE sii_document_class_id IS NOT NULL AND company_id = %s",
+                (target_company_id,),
+            )
+            tgt_by_docclass = {row['sii_document_class_id']: row['id'] for row in cur.fetchall()}
+
+        mapped = 0
+        for row in src_sii_seqs:
+            src_dc = row['sii_document_class_id']
+            tgt_dc = doc_class_map.get(src_dc, src_dc)
+            tgt_seq_id = tgt_by_docclass.get(tgt_dc)
+            if tgt_seq_id:
+                self.base.id_map['ir_sequence'][row['id']] = tgt_seq_id
+                mapped += 1
+            else:
+                log.warning(
+                    "ir_sequence: sin mapeo para src_id=%s sii_document_class_id %s→%s",
+                    row['id'], src_dc, tgt_dc,
+                )
+        log.info("ir_sequence: %d secuencias SII mapeadas en id_map.", mapped)
+
+        # Activar is_dte en todas las secuencias SII de la empresa destino
+        # (en Odoo 12 no existía is_dte; el domain del campo sequence_id usa is_dte=True)
+        with self.tgt_conn.cursor() as cur:
+            cur.execute(
+                """UPDATE ir_sequence SET is_dte = TRUE
+                    WHERE sii_document_class_id IS NOT NULL
+                      AND company_id = %s
+                      AND (is_dte IS NULL OR is_dte = FALSE)""",
+                (target_company_id,),
+            )
+            log.info("ir_sequence: %d registros actualizados con is_dte=True.", cur.rowcount)
+        self.tgt_conn.commit()
+
+        # ── 3. Migrar dte.caf ────────────────────────────────────────────────
+        src_table = next(
+            (t for t in ('dte_caf', 'l10n_cl_dte_caf') if self.base.table_exists_in_src(t)), None
+        )
+        tgt_table = next(
+            (t for t in ('dte_caf', 'l10n_cl_dte_caf') if self.base.table_exists_in_tgt(t)), None
+        )
+        if not src_table or not tgt_table:
+            log.warning("dte.caf: tabla no encontrada en origen o destino, saltando.")
+            return
+
+        # Limpiar registros previos de la company en destino
+        with self.tgt_conn.cursor() as cur:
+            cur.execute(f'DELETE FROM "{tgt_table}" WHERE company_id = %s', (target_company_id,))
+            deleted = cur.rowcount
+        self.tgt_conn.commit()
+        log.info("dte_caf: %d registros previos eliminados (company_id=%s).", deleted, target_company_id)
+
+        src_cols = self.base.get_src_columns(src_table)
+        tgt_cols = self.base.get_tgt_columns(tgt_table)
+
+        # Columnas que vienen con nombre diferente o no existen en destino
+        skip = {'id', 'message_main_attachment_id', 'caf_file',
+                'sii_document_class', 'status'}
+
+        # Filtrar source_company_ids mapeados al target_company_id
+        src_company_ids = [sid for sid, tid in self.base.company_mapping.items()
+                           if tid == target_company_id]
+        ph = ','.join(['%s'] * len(src_company_ids))
+        rows = self.base.fetch_src(
+            f'SELECT * FROM "{src_table}" WHERE company_id IN ({ph}) ORDER BY id',
+            params=src_company_ids,
+        )
+
+        self.base.id_map.setdefault(src_table, {})
+        if src_table != tgt_table:
+            self.base.id_map.setdefault(tgt_table, {})
+
+        status_map = {
+            'draft': 'draft', 'in_use': 'in_use',
+            'spent': 'spent', 'expired': 'expired',
+        }
+
+        inserted = 0
+        with self.tgt_conn.cursor() as cur:
+            for row in rows:
+                old_id = row['id']
+                rec = {}
+
+                # Copiar campos comunes
+                for col in src_cols:
+                    if col in skip or col not in tgt_cols:
+                        continue
+                    rec[col] = row[col]
+
+                # company_id
+                rec['company_id'] = self.base.map_company(row.get('company_id'))
+
+                # sii_document_class (origen) → document_class_id (destino)
+                if 'sii_document_class' in src_cols and 'document_class_id' in tgt_cols:
+                    old_dc = row.get('sii_document_class')
+                    if old_dc:
+                        rec['document_class_id'] = doc_class_map.get(old_dc, old_dc)
+
+                # sequence_id: mapear via id_map (relación 1:N)
+                if 'sequence_id' in src_cols and 'sequence_id' in tgt_cols:
+                    old_seq = row.get('sequence_id')
+                    rec['sequence_id'] = self.base.id_map.get('ir_sequence', {}).get(old_seq)
+
+                # status (origen) → state (destino)
+                if 'status' in src_cols and 'state' in tgt_cols:
+                    rec['state'] = status_map.get(row.get('status'), row.get('status'))
+
+                # filename: hacer único por empresa añadiendo _c{company_id} antes de la extensión
+                if rec.get('filename'):
+                    stem, ext = rec['filename'].rsplit('.', 1) if '.' in rec['filename'] \
+                        else (rec['filename'], '')
+                    rec['filename'] = f"{stem}_c{target_company_id}.{ext}" if ext \
+                        else f"{stem}_c{target_company_id}"
+
+                # Limpiar FK = 0
+                for f in list(rec.keys()):
+                    if f.endswith('_id') and rec[f] == 0:
+                        rec[f] = None
+
+                rec['create_uid'] = 1
+                rec['write_uid'] = 1
                 self.base._fill_not_null(rec, tgt_cols)
 
                 cols_q = ', '.join(f'"{c}"' for c in rec)
@@ -566,7 +768,8 @@ class Migrator12to16:
                         continue
                     rec[col] = row[col]
 
-                rec['company_id'] = self.base.map_company(row.get('company_id'))
+                # sii_firma en destino usa company_ids (many2many), no company_id
+                # La relación se inserta en res_company_sii_firma_rel después del INSERT
 
                 # Limpiar FK = 0
                 for f in list(rec.keys()):
@@ -589,6 +792,13 @@ class Migrator12to16:
                     self.base.id_map[src_table][old_id] = new_id
                     if src_table != tgt_table:
                         self.base.id_map[tgt_table][old_id] = new_id
+                    # Vincular al company_ids mediante la tabla many2many
+                    target_company_id = self.base.map_company(row.get('company_id'))
+                    cur.execute(
+                        'INSERT INTO res_company_sii_firma_rel (sii_firma_id, res_company_id) '
+                        'VALUES (%s, %s) ON CONFLICT DO NOTHING',
+                        (new_id, target_company_id),
+                    )
                     inserted += 1
                 except Exception as e:
                     self.tgt_conn.rollback()

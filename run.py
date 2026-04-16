@@ -173,6 +173,10 @@ def run_step(migrator: Migrator12to16, step: str):
         )
     elif step == 'purchases':
         migrator.migrate_purchases()
+    elif step == 'sii_firma':
+        migrator.migrate_sii_firma()
+    elif step == 'sequences_caf':
+        migrator.migrate_sii_sequences_and_caf()
     else:
         log.error("Paso desconocido: %s", step)
         sys.exit(1)
@@ -190,7 +194,7 @@ def main():
     )
     parser.add_argument(
         '--step',
-        choices=['companies', 'accounting', 'stock', 'pos', 'sales', 'purchases'],
+        choices=['companies', 'accounting', 'stock', 'pos', 'sales', 'purchases', 'sii_firma', 'sequences_caf'],
         help='Ejecutar solo un paso específico de la migración'
     )
     parser.add_argument(
