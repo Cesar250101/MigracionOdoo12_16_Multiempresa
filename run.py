@@ -173,6 +173,10 @@ def run_step(migrator: Migrator12to16, step: str):
         )
     elif step == 'purchases':
         migrator.migrate_purchases()
+    elif step == 'repair':
+        migrator.repair.migrate_all()
+    elif step == 'journal_sii':
+        migrator.migrate_journal_sii_sequences_caf()
     elif step == 'sii_firma':
         migrator.migrate_sii_firma()
     elif step == 'sequences_caf':
@@ -194,7 +198,8 @@ def main():
     )
     parser.add_argument(
         '--step',
-        choices=['companies', 'accounting', 'stock', 'pos', 'sales', 'purchases', 'sii_firma', 'sequences_caf'],
+        choices=['companies', 'accounting', 'stock', 'pos', 'sales', 'purchases',
+                 'sii_firma', 'sequences_caf', 'repair', 'journal_sii'],
         help='Ejecutar solo un paso específico de la migración'
     )
     parser.add_argument(

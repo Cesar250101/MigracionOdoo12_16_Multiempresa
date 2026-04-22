@@ -7,7 +7,7 @@ Migración Odoo 12 -> Odoo 16 Multiempresa
 # CONFIGURACIÓN BASE DE DATOS ORIGEN (Odoo 12)
 # ─────────────────────────────────────────────
 SOURCE_DB = {
-    'dbname': 'grupoqualitas',
+    'dbname': 'servitk',
     'user': 'postgres',
     'password': '2010626Ab',
     'host': '168.232.165.138',
@@ -32,12 +32,12 @@ TARGET_DB = {
 # Formato: {'source_id': ID en Odoo 12, 'target_id': ID en Odoo 16 (0 = crear nueva)}
 # Si target_id = 0, la empresa se creará automáticamente en Odoo 16.
 COMPANY_MIGRATION = [
-    {'source_id': 1, 'target_id': 67, 'name': 'Empresa Principal'},
+    {'source_id': 1, 'target_id': 54, 'name': 'Empresa Principal'},
     # {'source_id': 2, 'target_id': 0, 'name': 'Sucursal Norte'},
 ]
 
 # Empresa fallback si no hay mapeo definido (para tablas sin company_id)
-DEFAULT_TARGET_COMPANY_ID = 67
+DEFAULT_TARGET_COMPANY_ID = 54
 
 # ─────────────────────────────────────────────
 # OPCIONES DE MIGRACIÓN
@@ -94,6 +94,10 @@ INVOICE_PAYMENT_STATE_MAP = {
 # TABLAS A LIMPIAR ANTES DE MIGRAR (orden inverso de FK)
 # ─────────────────────────────────────────────
 TABLES_TO_CLEAN = [
+    # Reparaciones (antes que stock: repair_line/fee tienen FK a stock_move)
+    'repair_fee',
+    'repair_line',
+    'repair_order',
     'account_partial_reconcile',
     'account_full_reconcile',
     'account_payment',
@@ -123,12 +127,12 @@ TABLES_TO_CLEAN = [
     'l10n_cl_dte_caf',
     'sii_firma',
     'l10n_cl_certificate',
-    'account_tax_repartition_line',
-    'account_tax',
+    # 'account_tax_repartition_line',
+    # 'account_tax',
     'account_journal',
     'account_account',
     'account_payment_term',
-    'account_fiscal_position',
+    # 'account_fiscal_position',
     'product_product',
     'product_template',
     'product_category',

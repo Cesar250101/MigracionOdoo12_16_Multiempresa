@@ -15,6 +15,7 @@ from modules.accounting import AccountingMigrator
 from modules.sales import SalesMigrator
 from modules.stock import StockMigrator
 from modules.pos import PosMigrator
+from modules.repair import RepairMigrator
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +48,7 @@ class Migrator12to16:
         self.sales = SalesMigrator(self.base)
         self.stock = StockMigrator(self.base)
         self.pos = PosMigrator(self.base)
+        self.repair = RepairMigrator(self.base)
 
     # ──────────────────────────────────────────────
     # Empresa multiempresa
@@ -259,15 +261,17 @@ class Migrator12to16:
         self._map_by_code('res_country', 'code')
         self._map_by_code('res_country_state', 'code')
         self._map_res_city()
+        self._map_sii_activity_description()
 
         src_cols = self.base.get_src_columns('res_partner')
         mapping = {}
 
         ref_fks = {
-            'country_id':  'res_country',
-            'state_id':    'res_country_state',
-            'city_id':     'res_city',
-            'title':       'res_partner_title',
+            'country_id':           'res_country',
+            'state_id':             'res_country_state',
+            'city_id':              'res_city',
+            'title':                'res_partner_title',
+            'activity_description': 'sii_activity_description',
         }
         for fk, ref in ref_fks.items():
             if fk in src_cols:
@@ -282,6 +286,45 @@ class Migrator12to16:
             mapping_fields=mapping,
             skip_fields=['message_main_attachment_id', 'category_id'],
         )
+
+    def _map_sii_activity_description(self):
+        """
+        Mapea sii_activity_description entre origen y destino por nombre (case-insensitive).
+        Los IDs difieren; el nombre es la clave estable.
+        En destino el campo name es jsonb {'en_US': '...'}.
+        """
+        if not self.base.table_exists_in_src('sii_activity_description') or \
+                not self.base.table_exists_in_tgt('sii_activity_description'):
+            return
+
+        src_rows = self.base.fetch_src("SELECT id, name FROM sii_activity_description")
+        self.base.id_map.setdefault('sii_activity_description', {})
+
+        with self.tgt_conn.cursor() as cur:
+            cur.execute("SELECT id, name FROM sii_activity_description")
+            tgt_map = {}
+            for tid, name in cur.fetchall():
+                # name puede ser string o jsonb dict
+                if isinstance(name, dict):
+                    key = (name.get('en_US') or name.get('es_CL') or
+                           next(iter(name.values()), '')).lower().strip()
+                else:
+                    key = (name or '').lower().strip()
+                tgt_map[key] = tid
+
+        matched = 0
+        for row in src_rows:
+            name = row['name']
+            if isinstance(name, dict):
+                key = (name.get('en_US') or next(iter(name.values()), '')).lower().strip()
+            else:
+                key = (name or '').lower().strip()
+            tgt_id = tgt_map.get(key)
+            if tgt_id:
+                self.base.id_map['sii_activity_description'][row['id']] = tgt_id
+                matched += 1
+
+        log.info("sii_activity_description: %d/%d registros mapeados.", matched, len(src_rows))
 
     # ──────────────────────────────────────────────
     # Productos
@@ -412,8 +455,33 @@ class Migrator12to16:
                 mapping_fields={'sequence_id': 'ir_sequence'},
             )
 
-        # is_dte no existe en Odoo 12; activarlo en secuencias SII recién migradas
+        # Agregar RUT de la empresa al nombre de cada secuencia migrada
+        # En Odoo 12 el RUT está en res_partner vinculado a la empresa
+        rut_rows = self.base.fetch_src(
+            "SELECT rc.id, rp.vat FROM res_company rc "
+            "JOIN res_partner rp ON rp.id = rc.partner_id "
+            "WHERE rp.vat IS NOT NULL"
+        )
+        rut_map = {}  # {target_company_id: vat}
+        for row in rut_rows:
+            tgt_cid = self.base.company_mapping.get(row['id'])
+            if tgt_cid and row['vat']:
+                rut_map[tgt_cid] = row['vat']
+
         with self.tgt_conn.cursor() as cur:
+            seq_ids = list(self.base.id_map.get('ir_sequence', {}).values())
+            if seq_ids and rut_map:
+                for tgt_cid, rut in rut_map.items():
+                    ph = ', '.join(['%s'] * len(seq_ids))
+                    cur.execute(
+                        f"UPDATE ir_sequence SET name = name || ' - ' || %s "
+                        f"WHERE id IN ({ph}) AND company_id = %s",
+                        [rut] + seq_ids + [tgt_cid],
+                    )
+                    log.info("ir_sequence: RUT '%s' agregado a %d secuencias (company_id=%s).",
+                             rut, cur.rowcount, tgt_cid)
+
+            # is_dte no existe en Odoo 12; activarlo en secuencias SII recién migradas
             cur.execute(
                 """UPDATE ir_sequence SET is_dte = TRUE
                     WHERE sii_document_class_id IS NOT NULL
@@ -717,6 +785,293 @@ class Migrator12to16:
 
         log.info("dte_caf: %d registros migrados.", inserted)
 
+    def migrate_journal_sii_sequences_caf(self, journal_type: str = 'sale'):
+        """
+        Migra ir_sequence + dte_caf SOLO para el diario de Facturas de Clientes
+        (type='sale'), usando account_journal_sii_document_class como tabla puente.
+
+        Flujo:
+          1. Localizar el journal de venta en origen.
+          2. Obtener sus entradas en account_journal_sii_document_class.
+          3. Migrar las ir_sequence de esas entradas (si no están ya en id_map).
+          4. Migrar los dte_caf asociados a esas sequences.
+          5. Migrar account_journal_sii_document_class vinculando al journal destino.
+        """
+        log.info("=== Migrando SII: ir_sequence + dte_caf para Facturas de Clientes ===")
+
+        SII_JDC_TABLE = 'account_journal_sii_document_class'
+
+        # ── 1. Journal de venta en origen ────────────────────────────────────
+        sale_journals = self.base.fetch_src(
+            "SELECT id, name, code FROM account_journal WHERE type=%s ORDER BY id",
+            (journal_type,)
+        )
+        if not sale_journals:
+            log.warning("No se encontraron journals type='%s' en origen.", journal_type)
+            return
+
+        src_journal = sale_journals[0]
+        src_journal_id = src_journal['id']
+        log.info("Journal origen: id=%s  code=%s  name=%s",
+                 src_journal_id, src_journal['code'], src_journal['name'])
+
+        # ── 2. Entradas en account_journal_sii_document_class ────────────────
+        if not self.base.table_exists_in_src(SII_JDC_TABLE):
+            log.warning("Tabla %s no encontrada en origen, saltando.", SII_JDC_TABLE)
+            return
+
+        jdc_rows = self.base.fetch_src(
+            f"SELECT * FROM {SII_JDC_TABLE} WHERE journal_id=%s ORDER BY sequence, id",
+            (src_journal_id,)
+        )
+        if not jdc_rows:
+            log.warning("No hay entradas en %s para journal_id=%s.", SII_JDC_TABLE, src_journal_id)
+            return
+
+        seq_ids = [r['sequence_id'] for r in jdc_rows if r.get('sequence_id')]
+        log.info("  %d document_classes encontradas, sequences: %s", len(jdc_rows), seq_ids)
+
+        # ── 3. Migrar ir_sequence filtradas ───────────────────────────────────
+        if seq_ids:
+            self.base.id_map.setdefault('ir_sequence', {})
+            tgt_seq_cols = self.base.get_tgt_columns('ir_sequence')
+            src_seq_cols = self.base.get_src_columns('ir_sequence')
+            skip_seq = {'id', 'message_main_attachment_id'}
+            skip_seq |= {c for c in src_seq_cols if c not in tgt_seq_cols}
+
+            ph = ', '.join(['%s'] * len(seq_ids))
+            seq_rows = self.base.fetch_src(
+                f"SELECT * FROM ir_sequence WHERE id IN ({ph}) ORDER BY id",
+                seq_ids
+            )
+
+            with self.tgt_conn.cursor() as cur:
+                for seq in seq_rows:
+                    old_id = seq['id']
+                    if old_id in self.base.id_map['ir_sequence']:
+                        log.debug("ir_sequence old_id=%s ya en id_map, saltando.", old_id)
+                        continue
+
+                    rec = {}
+                    for col in src_seq_cols:
+                        if col in skip_seq or col not in tgt_seq_cols:
+                            continue
+                        rec[col] = seq[col]
+
+                    rec['company_id'] = self.base.map_company(seq.get('company_id'))
+                    rec['create_uid'] = 1
+                    rec['write_uid'] = 1
+
+                    for f in list(rec.keys()):
+                        if f.endswith('_id') and rec[f] == 0:
+                            rec[f] = None
+
+                    self.base._fill_not_null(rec, tgt_seq_cols)
+
+                    cols_q = ', '.join(f'"{c}"' for c in rec)
+                    placeholders = ', '.join(['%s'] * len(rec))
+                    try:
+                        cur.execute(
+                            f'INSERT INTO ir_sequence ({cols_q}) VALUES ({placeholders}) RETURNING id',
+                            self.base.prepare_vals(rec, tgt_seq_cols),
+                        )
+                        new_id = cur.fetchone()[0]
+                        self.base.id_map['ir_sequence'][old_id] = new_id
+                        log.info("  ir_sequence old_id=%s -> new_id=%s  (%s)",
+                                 old_id, new_id, seq.get('name', ''))
+                    except Exception as e:
+                        self.tgt_conn.rollback()
+                        log.error("ir_sequence old_id=%s: %s", old_id, e)
+
+            # Sub-rangos de secuencia
+            if self.base.table_exists_in_src('ir_sequence_date_range') and \
+                    self.base.table_exists_in_tgt('ir_sequence_date_range'):
+                ph = ', '.join(['%s'] * len(seq_ids))
+                dr_rows = self.base.fetch_src(
+                    f"SELECT * FROM ir_sequence_date_range WHERE sequence_id IN ({ph}) ORDER BY id",
+                    seq_ids
+                )
+                self.base.id_map.setdefault('ir_sequence_date_range', {})
+                tgt_dr_cols = self.base.get_tgt_columns('ir_sequence_date_range')
+                dr_inserted = 0
+                with self.tgt_conn.cursor() as cur:
+                    for dr in dr_rows:
+                        new_seq_id = self.base.id_map['ir_sequence'].get(dr['sequence_id'])
+                        if not new_seq_id:
+                            continue
+                        rec = {
+                            'sequence_id': new_seq_id,
+                            'date_from': dr.get('date_from'),
+                            'date_to': dr.get('date_to'),
+                            'number_next_actual': dr.get('number_next_actual', 1),
+                            'create_uid': 1,
+                            'write_uid': 1,
+                        }
+                        self.base._fill_not_null(rec, tgt_dr_cols)
+                        cols_q = ', '.join(f'"{c}"' for c in rec)
+                        placeholders = ', '.join(['%s'] * len(rec))
+                        try:
+                            cur.execute(
+                                f'INSERT INTO ir_sequence_date_range ({cols_q}) VALUES ({placeholders})',
+                                self.base.prepare_vals(rec, tgt_dr_cols),
+                            )
+                            dr_inserted += 1
+                        except Exception as e:
+                            self.tgt_conn.rollback()
+                            log.warning("ir_sequence_date_range: %s", e)
+                log.info("  ir_sequence_date_range: %d rangos migrados.", dr_inserted)
+
+        # ── 4. Migrar dte_caf para esas sequences ─────────────────────────────
+        caf_src = next((t for t in ('dte_caf', 'l10n_cl_dte_caf')
+                        if self.base.table_exists_in_src(t)), None)
+        caf_tgt = next((t for t in ('dte_caf', 'l10n_cl_dte_caf')
+                        if self.base.table_exists_in_tgt(t)), None)
+
+        if caf_src and caf_tgt and seq_ids:
+            ph = ', '.join(['%s'] * len(seq_ids))
+            caf_rows = self.base.fetch_src(
+                f"SELECT * FROM {caf_src} WHERE sequence_id IN ({ph}) ORDER BY id",
+                seq_ids
+            )
+            src_caf_cols = self.base.get_src_columns(caf_src)
+            tgt_caf_cols = self.base.get_tgt_columns(caf_tgt)
+            skip_caf = {'id', 'message_main_attachment_id', 'sii_document_class', 'status', 'caf_file'}
+            doc_class_map = self.accounting._build_sii_doc_class_map()
+            status_map = {'draft': 'draft', 'in_use': 'in_use',
+                          'spent': 'spent', 'expired': 'expired'}
+
+            self.base.id_map.setdefault(caf_src, {})
+            if caf_src != caf_tgt:
+                self.base.id_map.setdefault(caf_tgt, {})
+
+            caf_inserted = 0
+            with self.tgt_conn.cursor() as cur:
+                for row in caf_rows:
+                    old_id = row['id']
+                    rec = {}
+                    for col in src_caf_cols:
+                        if col in skip_caf or col not in tgt_caf_cols:
+                            continue
+                        rec[col] = row[col]
+
+                    rec['company_id'] = self.base.map_company(row.get('company_id'))
+
+                    if 'sequence_id' in src_caf_cols and 'sequence_id' in tgt_caf_cols:
+                        rec['sequence_id'] = self.base.id_map['ir_sequence'].get(row.get('sequence_id'))
+
+                    if 'journal_id' in src_caf_cols and 'journal_id' in tgt_caf_cols:
+                        rec['journal_id'] = self.base.id_map.get('account_journal', {}).get(
+                            row.get('journal_id'))
+
+                    if 'sii_document_class' in src_caf_cols and 'document_class_id' in tgt_caf_cols:
+                        old_dc = row.get('sii_document_class')
+                        if old_dc:
+                            rec['document_class_id'] = doc_class_map.get(old_dc, old_dc)
+
+                    if 'status' in src_caf_cols and 'state' in tgt_caf_cols:
+                        rec['state'] = status_map.get(row.get('status'), row.get('status') or 'draft')
+
+                    for f in list(rec.keys()):
+                        if f.endswith('_id') and rec[f] == 0:
+                            rec[f] = None
+
+                    rec['create_uid'] = 1
+                    rec['write_uid'] = 1
+                    self.base._fill_not_null(rec, tgt_caf_cols)
+
+                    cols_q = ', '.join(f'"{c}"' for c in rec)
+                    placeholders = ', '.join(['%s'] * len(rec))
+                    try:
+                        cur.execute(
+                            f'INSERT INTO "{caf_tgt}" ({cols_q}) VALUES ({placeholders}) RETURNING id',
+                            self.base.prepare_vals(rec, tgt_caf_cols),
+                        )
+                        new_id = cur.fetchone()[0]
+                        self.base.id_map[caf_src][old_id] = new_id
+                        if caf_src != caf_tgt:
+                            self.base.id_map[caf_tgt][old_id] = new_id
+                        caf_inserted += 1
+                    except Exception as e:
+                        self.tgt_conn.rollback()
+                        log.error("dte_caf old_id=%s: %s", old_id, e)
+
+            log.info("  dte_caf: %d registros migrados.", caf_inserted)
+        else:
+            log.info("  dte_caf: tabla no encontrada o sin sequences, saltando.")
+
+        # ── 5. Migrar account_journal_sii_document_class ─────────────────────
+        if not self.base.table_exists_in_tgt(SII_JDC_TABLE):
+            log.warning("Tabla %s no existe en destino, saltando.", SII_JDC_TABLE)
+            return
+
+        # Mapear journal de venta en destino
+        tgt_journal_id = self.base.id_map.get('account_journal', {}).get(src_journal_id)
+        if not tgt_journal_id:
+            # Buscar en destino por code
+            with self.tgt_conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM account_journal WHERE code=%s AND company_id=%s LIMIT 1",
+                    (src_journal['code'], self.base.map_company(None))
+                )
+                row = cur.fetchone()
+                tgt_journal_id = row[0] if row else None
+
+        if not tgt_journal_id:
+            log.warning("No se encontró journal destino para src_id=%s, "
+                        "saltando account_journal_sii_document_class.", src_journal_id)
+            return
+
+        src_jdc_cols = self.base.get_src_columns(SII_JDC_TABLE)
+        tgt_jdc_cols = self.base.get_tgt_columns(SII_JDC_TABLE)
+        doc_class_map = self.accounting._build_sii_doc_class_map()
+
+        jdc_inserted = 0
+        with self.tgt_conn.cursor() as cur:
+            for row in jdc_rows:
+                old_id = row['id']
+
+                # document_class: en destino puede ser sii_document_class_id mapeado
+                new_dc_id = doc_class_map.get(row.get('sii_document_class_id'),
+                                              row.get('sii_document_class_id'))
+
+                new_seq_id = self.base.id_map.get('ir_sequence', {}).get(
+                    row.get('sequence_id'))
+
+                rec = {
+                    'journal_id': tgt_journal_id,
+                    'sii_document_class_id': new_dc_id,
+                    'sequence_id': new_seq_id,
+                    'sequence': row.get('sequence', 0),
+                    'company_id': self.base.map_company(row.get('company_id')),
+                    'create_uid': 1,
+                    'write_uid': 1,
+                }
+
+                # Limpiar FK=0
+                for f in list(rec.keys()):
+                    if f.endswith('_id') and rec[f] == 0:
+                        rec[f] = None
+
+                # Filtrar campos que no existen en destino
+                rec = {k: v for k, v in rec.items() if k in tgt_jdc_cols}
+                self.base._fill_not_null(rec, tgt_jdc_cols)
+
+                cols_q = ', '.join(f'"{c}"' for c in rec)
+                placeholders = ', '.join(['%s'] * len(rec))
+                try:
+                    cur.execute(
+                        f'INSERT INTO {SII_JDC_TABLE} ({cols_q}) VALUES ({placeholders}) '
+                        f'ON CONFLICT DO NOTHING',
+                        self.base.prepare_vals(rec, tgt_jdc_cols),
+                    )
+                    jdc_inserted += 1
+                except Exception as e:
+                    self.tgt_conn.rollback()
+                    log.error("account_journal_sii_document_class old_id=%s: %s", old_id, e)
+
+        log.info("  account_journal_sii_document_class: %d entradas migradas "
+                 "(journal_id destino=%s).", jdc_inserted, tgt_journal_id)
+
     def migrate_sii_firma(self):
         """
         Migra la tabla sii.firma (certificado digital para firma electrónica).
@@ -860,9 +1215,14 @@ class Migrator12to16:
             # 12. Compras
             self.migrate_purchases()
 
-            # 12b. CAF y firma localización chilena
+            # 12c. Reparaciones
+            self.repair.migrate_all()
+
+            # 12b. CAF, firma y secuencias SII localización chilena
             self.migrate_sii_firma()
             self.migrate_dte_caf()
+            # Secuencias + CAF + account_journal_sii_document_class para Facturas de Clientes
+            self.migrate_journal_sii_sequences_caf()
 
             # 13. Facturas (account_invoice -> account_move)
             self.accounting.migrate_invoices()

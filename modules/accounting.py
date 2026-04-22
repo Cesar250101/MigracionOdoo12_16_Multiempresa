@@ -175,6 +175,7 @@ class AccountingMigrator:
 
         # Construir mapa company_id -> country_id desde res_company/res_partner en destino
         company_country_map = {}
+        fallback_country_id = None
         with self.b.tgt_conn.cursor() as cur:
             cur.execute("""
                 SELECT c.id, p.country_id
@@ -183,6 +184,11 @@ class AccountingMigrator:
             """)
             for row in cur.fetchall():
                 company_country_map[row[0]] = row[1]
+
+            # Fallback: país Chile (CL) para empresas sin country_id configurado
+            cur.execute("SELECT id FROM res_country WHERE code='CL' LIMIT 1")
+            row = cur.fetchone()
+            fallback_country_id = row[0] if row else None
 
         inserted_taxes = 0
         inserted_repr = 0
@@ -211,7 +217,8 @@ class AccountingMigrator:
 
                 # country_id es NOT NULL en Odoo 16: viene de la empresa destino
                 if 'country_id' in tgt_tax_cols:
-                    tax_rec['country_id'] = company_country_map.get(new_company_id)
+                    tax_rec['country_id'] = (company_country_map.get(new_company_id)
+                                             or fallback_country_id)
 
                 # Campos que pueden no existir en Odoo 16
                 if 'analytic' in tgt_tax_cols:
@@ -668,6 +675,9 @@ class AccountingMigrator:
                 rec['company_id'] = self.b.map_company(entry.get('company_id'))
                 rec['create_uid'] = 1
                 rec['write_uid'] = 1
+                # auto_post es NOT NULL en Odoo 16, valor por defecto 'no'
+                if 'auto_post' in tgt_move_cols:
+                    rec['auto_post'] = 'no'
 
                 # Mapear FKs
                 for fk_field, ref_table in [

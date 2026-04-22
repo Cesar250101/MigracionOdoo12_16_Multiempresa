@@ -64,6 +64,8 @@ class StockMigrator:
         """
         Migra stock_warehouse. Los campos de rutas/reglas se omiten en este paso
         y se actualizan en post_migration_stock (evita dependencias circulares).
+        Los picking_type fields se omiten aquí y se actualizan en post_migration_stock
+        (después de migrate_picking_types) para evitar referencias inválidas.
         """
         log.info("Migrando almacenes (stock_warehouse)...")
         self.b.migrate_table(
@@ -78,17 +80,26 @@ class StockMigrator:
                 'wh_pack_stock_loc_id': 'stock_location',
             },
             skip_fields=[
+                # Rutas/reglas: se actualizan en post_migration_stock
                 'mto_pull_id', 'manufacture_pull_id', 'manufacture_mto_pull_id',
                 'pbm_mto_pull_id', 'sam_rule_id', 'buy_pull_id',
                 'subcontracting_mto_pull_id', 'subcontracting_pull_id',
                 'crossdock_route_id', 'reception_route_id', 'delivery_route_id',
                 'pbm_route_id', 'subcontracting_route_id',
+                # Picking types: se actualizan en post_migration_stock (después de migrate_picking_types)
+                'in_type_id', 'out_type_id', 'pick_type_id', 'int_type_id',
+                'pack_type_id', 'manu_type_id', 'pos_type_id',
+                'pbm_type_id', 'sam_type_id',
+                'return_type_id', 'subcontracting_type_id', 'subcontracting_resupply_type_id',
                 'message_main_attachment_id',
             ],
         )
 
     def migrate_picking_types(self):
-        """Migra stock_picking_type."""
+        """Migra stock_picking_type.
+        return_picking_type_id se omite aquí (auto-referencia entre picking types)
+        y se actualiza en post_migration_stock después de mapear todos los tipos.
+        """
         log.info("Migrando tipos de operación (stock_picking_type)...")
         self.b.migrate_table(
             'stock_picking_type',
@@ -98,7 +109,36 @@ class StockMigrator:
                 'default_location_dest_id': 'stock_location',
                 'sequence_id': 'ir_sequence',
             },
+            skip_fields=['return_picking_type_id'],
         )
+
+    def _post_migrate_picking_type_returns(self):
+        """Actualiza return_picking_type_id en stock_picking_type (auto-referencia)."""
+        log.info("Post-migración: vinculando return_picking_type_id en stock_picking_type...")
+        pt_map = self.b.id_map.get('stock_picking_type', {})
+        if not pt_map:
+            return
+
+        src_rows = self.b.fetch_src(
+            "SELECT id, return_picking_type_id FROM stock_picking_type "
+            "WHERE return_picking_type_id IS NOT NULL"
+        )
+        updated = 0
+        with self.b.tgt_conn.cursor() as cur:
+            for row in src_rows:
+                tgt_id = pt_map.get(row['id'])
+                tgt_ret = pt_map.get(row['return_picking_type_id'])
+                if tgt_id and tgt_ret:
+                    try:
+                        cur.execute(
+                            "UPDATE stock_picking_type SET return_picking_type_id=%s WHERE id=%s",
+                            (tgt_ret, tgt_id)
+                        )
+                        updated += 1
+                    except Exception as e:
+                        self.b.tgt_conn.rollback()
+                        log.warning("return_picking_type_id src_id=%s: %s", row['id'], e)
+        log.info("stock_picking_type: %d return_picking_type_id actualizados.", updated)
 
     def migrate_routes(self):
         """Migra rutas y reglas de abastecimiento."""
@@ -420,6 +460,19 @@ class StockMigrator:
             ('delivery_route_id', 'stock_route'),
             ('pbm_route_id', 'stock_route'),
             ('subcontracting_route_id', 'stock_route'),
+            # Picking types: ahora se mapean aquí después de migrate_picking_types
+            ('in_type_id', 'stock_picking_type'),
+            ('out_type_id', 'stock_picking_type'),
+            ('pick_type_id', 'stock_picking_type'),
+            ('int_type_id', 'stock_picking_type'),
+            ('pack_type_id', 'stock_picking_type'),
+            ('manu_type_id', 'stock_picking_type'),
+            ('pos_type_id', 'stock_picking_type'),
+            ('pbm_type_id', 'stock_picking_type'),
+            ('sam_type_id', 'stock_picking_type'),
+            ('return_type_id', 'stock_picking_type'),
+            ('subcontracting_type_id', 'stock_picking_type'),
+            ('subcontracting_resupply_type_id', 'stock_picking_type'),
         ]
 
         active_fields = [(f, t) for f, t in route_rule_fields if f in src_cols]
@@ -457,3 +510,6 @@ class StockMigrator:
                         log.warning("stock_warehouse update id=%s: %s", tgt_sw_id, e)
 
         log.info("stock_warehouse post-migración: %d almacenes actualizados.", updated)
+
+        # Actualizar return_picking_type_id (auto-referencia entre picking types)
+        self._post_migrate_picking_type_returns()
