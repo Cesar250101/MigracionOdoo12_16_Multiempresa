@@ -464,8 +464,8 @@ class AccountingMigrator:
                 ai.partner_shipping_id,
                 ai.sent                     AS invoice_sent,
                 am.id                       AS old_move_id,
-                am.journal_id,
-                am.date,
+                COALESCE(am.journal_id, ai.journal_id) AS journal_id,
+                COALESCE(am.date, ai.date_invoice)     AS date,
                 am.name                     AS move_name_journal,
                 am.ref                      AS move_ref
                 {_sii_select}
@@ -539,17 +539,19 @@ class AccountingMigrator:
 
                 # ── Campos SII plain (copiar valor directamente) ──────────
                 for _c in sii_plain_cols:
+                    # sii_xml_request es un FK en Odoo 16 aunque no termine en _id
+                    if _c == 'sii_xml_request':
+                        continue
                     _v = inv.get(_c)
                     if _v is not None:
                         rec[_c] = _v
 
-                # ── Campos SII FK (mapear ID o copiar directamente) ───────
+                # ── Campos SII FK (mapear ID; NULL si no existe en destino) ─
                 for _c in sii_fk_cols:
                     _old_id = inv.get(_c)
                     if _old_id:
-                        # Intentar via id_map usando el nombre de tabla sin '_id'
                         _ref = _c[:-3]
-                        rec[_c] = self.b.id_map.get(_ref, {}).get(_old_id, _old_id)
+                        rec[_c] = self.b.id_map.get(_ref, {}).get(_old_id)  # None si no mapeado
 
                 # ── document_class_id ─────────────────────────────────────
                 if has_doc_class:

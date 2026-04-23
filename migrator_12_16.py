@@ -30,7 +30,14 @@ class Migrator12to16:
 
         log.info("Conectando a BD origen (Odoo 12): %s@%s/%s",
                  source_db['user'], source_db['host'], source_db['dbname'])
-        self.src_conn = psycopg2.connect(**source_db)
+        # keepalives evitan que el firewall/NAT cierre la conexión remota inactiva
+        self.src_conn = psycopg2.connect(
+            **source_db,
+            keepalives=1,
+            keepalives_idle=60,
+            keepalives_interval=10,
+            keepalives_count=5,
+        )
 
         log.info("Conectando a BD destino (Odoo 16): %s@%s/%s",
                  target_db['user'], target_db['host'], target_db['dbname'])
