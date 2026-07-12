@@ -250,6 +250,11 @@ class BaseMigrator:
                     self.tgt_conn.rollback()
                     log.warning("Saltando %s old_id=%s (FK violation): %s",
                                 table, old_id, str(e).split('\n')[0])
+                except psycopg2.errors.CheckViolation as e:
+                    # Constraint CHECK violado (ej: campo requerido quedó NULL tras mapeo FK)
+                    self.tgt_conn.rollback()
+                    log.warning("Saltando %s old_id=%s (check violation): %s",
+                                table, old_id, str(e).split('\n')[0])
                 except Exception as e:
                     self.tgt_conn.rollback()
                     log.error("Error en %s old_id=%s: %s", table, old_id, e)
@@ -438,6 +443,43 @@ class BaseMigrator:
             elif table == 'product_category':
                 cur.execute('SELECT id FROM product_category WHERE name=%s LIMIT 1',
                             (row_dict.get('name'),))
+            elif table == 'product_template':
+                default_code = row_dict.get('default_code')
+                if default_code:
+                    cur.execute(
+                        'SELECT id FROM product_template WHERE default_code=%s '
+                        'AND (company_id=%s OR company_id IS NULL) LIMIT 1',
+                        (default_code, row_dict.get('company_id'))
+                    )
+                else:
+                    cur.execute(
+                        'SELECT id FROM product_template WHERE name=%s '
+                        'AND (company_id=%s OR company_id IS NULL) LIMIT 1',
+                        (row_dict.get('name'), row_dict.get('company_id'))
+                    )
+            elif table == 'product_product':
+                default_code = row_dict.get('default_code')
+                tmpl_id = row_dict.get('product_tmpl_id')
+                company_id = row_dict.get('company_id')
+                if default_code:
+                    # Acotar a la empresa destino (o productos compartidos company_id NULL)
+                    cur.execute(
+                        'SELECT id FROM product_product WHERE default_code=%s '
+                        'AND (company_id=%s OR company_id IS NULL) LIMIT 1',
+                        (default_code, company_id)
+                    )
+                elif tmpl_id:
+                    cur.execute(
+                        'SELECT id FROM product_product WHERE product_tmpl_id=%s LIMIT 1',
+                        (tmpl_id,)
+                    )
+                else:
+                    return None
+            elif table == 'stock_picking_type':
+                cur.execute(
+                    'SELECT id FROM stock_picking_type WHERE name=%s AND company_id=%s LIMIT 1',
+                    (row_dict.get('name'), row_dict.get('company_id'))
+                )
             else:
                 return None
 
@@ -473,10 +515,13 @@ class BaseMigrator:
         """
         Pre-carga el id_map de una tabla mapeando IDs iguales (útil para tablas
         de configuración como res_currency que no se migran sino que se hacen match).
+
+        Usa setdefault para no pisar mapeos reales ya cargados (ej. res_users
+        migrados explícitamente vía UsersMigrator, con old_id != new_id).
         """
         if table not in self.id_map:
             self.id_map[table] = {}
         with self.tgt_conn.cursor() as cur:
             cur.execute(f'SELECT id FROM "{table}"')
             for (tgt_id,) in cur.fetchall():
-                self.id_map[table][tgt_id] = tgt_id
+                self.id_map[table].setdefault(tgt_id, tgt_id)

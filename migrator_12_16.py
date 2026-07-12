@@ -16,6 +16,8 @@ from modules.sales import SalesMigrator
 from modules.stock import StockMigrator
 from modules.pos import PosMigrator
 from modules.repair import RepairMigrator
+from modules.method_minori import MethodMinoriMigrator
+from modules.users import UsersMigrator
 
 log = logging.getLogger(__name__)
 
@@ -54,8 +56,10 @@ class Migrator12to16:
         self.accounting = AccountingMigrator(self.base)
         self.sales = SalesMigrator(self.base)
         self.stock = StockMigrator(self.base)
-        self.pos = PosMigrator(self.base)
+        self.pos = PosMigrator(self.base, self.accounting)
         self.repair = RepairMigrator(self.base)
+        self.method_minori = MethodMinoriMigrator(self.base)
+        self.users = UsersMigrator(self.base)
 
     # ──────────────────────────────────────────────
     # Empresa multiempresa
@@ -102,6 +106,62 @@ class Migrator12to16:
                     log.error("Error creando empresa src=%d: %s", src_id, e)
 
     # ──────────────────────────────────────────────
+    # Normalización previa de company_id
+    # ──────────────────────────────────────────────
+
+    def normalize_existing_company_id(self):
+        """
+        Antes de migrar, fuerza company_id = EXISTING_DATA_COMPANY_ID en TODAS
+        las filas de destino que ya existían (en cualquier tabla que tenga esa
+        columna), para separar limpiamente "lo que ya existía" (empresa
+        EXISTING_DATA_COMPANY_ID) de "lo que se migra desde Odoo 12" (empresa
+        DEFAULT_TARGET_COMPANY_ID).
+
+        Protege las filas que ya pertenecen a DEFAULT_TARGET_COMPANY_ID para
+        que un rerun de la migración completa no le quite datos ya migrados.
+        """
+        log.info("=== Normalizando company_id de datos preexistentes ===")
+
+        with self.tgt_conn.cursor() as cur:
+            cur.execute("""
+                SELECT c.table_name
+                FROM information_schema.columns c
+                JOIN information_schema.tables t
+                  ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+                WHERE c.column_name = 'company_id'
+                  AND c.table_schema = 'public'
+                  AND t.table_type = 'BASE TABLE'
+                ORDER BY c.table_name
+            """)
+            tables = [row[0] for row in cur.fetchall()]
+
+        updated_tables = 0
+        total_rows = 0
+        with self.tgt_conn.cursor() as cur:
+            for table in tables:
+                try:
+                    cur.execute(
+                        f'UPDATE "{table}" SET company_id = %s '
+                        f'WHERE company_id IS DISTINCT FROM %s '
+                        f'  AND company_id IS DISTINCT FROM %s',
+                        (cfg.EXISTING_DATA_COMPANY_ID,
+                         cfg.EXISTING_DATA_COMPANY_ID,
+                         cfg.DEFAULT_TARGET_COMPANY_ID),
+                    )
+                    if cur.rowcount:
+                        updated_tables += 1
+                        total_rows += cur.rowcount
+                        log.debug("%s: %d filas -> company_id=%s",
+                                  table, cur.rowcount, cfg.EXISTING_DATA_COMPANY_ID)
+                except Exception as e:
+                    self.tgt_conn.rollback()
+                    log.warning("No se pudo normalizar company_id en %s: %s",
+                                table, str(e).split('\n')[0])
+
+        log.info("Normalización company_id: %d tablas modificadas, %d filas actualizadas a company_id=%s.",
+                  updated_tables, total_rows, cfg.EXISTING_DATA_COMPANY_ID)
+
+    # ──────────────────────────────────────────────
     # Limpieza previa
     # ──────────────────────────────────────────────
 
@@ -117,8 +177,61 @@ class Migrator12to16:
             log.warning("No hay company_ids mapeados, saltando limpieza.")
             return
 
+        # Tablas con limpieza especial (DELETEs seguros con subqueries de FK)
+        SAFE_DELETE_TABLES = {'product_product', 'product_template', 'res_partner'}
+
         with self.tgt_conn.cursor() as cur:
+            # --- Limpiar tablas sin company_id que bloquearían account_account ---
+            # account_fiscal_position_account/tax referencian account_account y
+            # account_tax pero no tienen company_id almacenado en BD (es related).
+            placeholders = ', '.join(['%s'] * len(company_ids))
+            for fpa_table in ('account_fiscal_position_account', 'account_fiscal_position_tax'):
+                try:
+                    cur.execute(
+                        f'DELETE FROM "{fpa_table}" WHERE position_id IN '
+                        f'(SELECT id FROM account_fiscal_position '
+                        f' WHERE company_id IN ({placeholders}))',
+                        list(company_ids)
+                    )
+                    log.debug("Limpiado: %s", fpa_table)
+                except Exception as e:
+                    self.tgt_conn.rollback()
+                    log.warning("No se pudo limpiar %s: %s", fpa_table, str(e).split('\n')[0])
+
+            # --- Limpiar pos_session (no tiene company_id propio; se deriva de
+            # config_id -> pos_config.company_id) ANTES del loop genérico, que
+            # la saltaría silenciosamente por no tener esa columna. Sin esto,
+            # las sesiones quedan huérfanas entre corridas y chocan por
+            # "pos_session_uniq_name" (UNIQUE global sobre name) en el rerun.
+            try:
+                cur.execute(
+                    f'DELETE FROM pos_session WHERE config_id IN '
+                    f'(SELECT id FROM pos_config WHERE company_id IN ({placeholders}))',
+                    list(company_ids)
+                )
+                log.debug("Limpiado: pos_session (%d filas)", cur.rowcount)
+            except Exception as e:
+                self.tgt_conn.rollback()
+                log.warning("No se pudo limpiar pos_session: %s", str(e).split('\n')[0])
+
+            # --- Limpiar account_payment (tampoco tiene company_id propio; se
+            # deriva de move_id -> account_move.company_id). Debe ir antes de
+            # que el loop genérico borre account_move, si no queda huérfano.
+            try:
+                cur.execute(
+                    f'DELETE FROM account_payment WHERE move_id IN '
+                    f'(SELECT id FROM account_move WHERE company_id IN ({placeholders}))',
+                    list(company_ids)
+                )
+                log.debug("Limpiado: account_payment (%d filas)", cur.rowcount)
+            except Exception as e:
+                self.tgt_conn.rollback()
+                log.warning("No se pudo limpiar account_payment: %s", str(e).split('\n')[0])
+
+            # --- Limpieza genérica (todas las tablas excepto las especiales) ---
             for table in cfg.TABLES_TO_CLEAN:
+                if table in SAFE_DELETE_TABLES:
+                    continue
                 try:
                     cur.execute(
                         "SELECT 1 FROM information_schema.columns "
@@ -137,7 +250,55 @@ class Migrator12to16:
                     log.debug("Limpiado: %s", table)
                 except Exception as e:
                     self.tgt_conn.rollback()
-                    log.debug("No se pudo limpiar %s: %s", table, e)
+                    log.warning("No se pudo limpiar %s: %s", table, str(e).split('\n')[0])
+
+            # --- Limpieza segura de product_product, product_template y res_partner ---
+            # Se usan DELETEs con subqueries para respetar FKs activas que no pudieron
+            # limpiarse (ej: res_company.partner_id impide borrar partner de la empresa).
+            for cid in company_ids:
+                # product_product primero (FK product_tmpl_id -> product_template)
+                try:
+                    cur.execute("""
+                        DELETE FROM product_product
+                        WHERE company_id = %s
+                          AND id NOT IN (SELECT product_id FROM account_move_line   WHERE COALESCE(product_id,0)!=0)
+                          AND id NOT IN (SELECT product_id FROM sale_order_line     WHERE COALESCE(product_id,0)!=0)
+                          AND id NOT IN (SELECT product_id FROM purchase_order_line WHERE COALESCE(product_id,0)!=0)
+                          AND id NOT IN (SELECT product_id FROM stock_move          WHERE COALESCE(product_id,0)!=0)
+                    """, (cid,))
+                    log.debug("product_product limpiado (company_id=%s).", cid)
+                except Exception as e:
+                    self.tgt_conn.rollback()
+                    log.warning("No se pudo limpiar product_product (company %s): %s", cid, str(e).split('\n')[0])
+
+                # product_template después (requiere product_product ya limpiado)
+                try:
+                    cur.execute("""
+                        DELETE FROM product_template
+                        WHERE company_id = %s
+                          AND id NOT IN (SELECT product_tmpl_id FROM product_product WHERE COALESCE(product_tmpl_id,0)!=0)
+                    """, (cid,))
+                    log.debug("product_template limpiado (company_id=%s).", cid)
+                except Exception as e:
+                    self.tgt_conn.rollback()
+                    log.warning("No se pudo limpiar product_template (company %s): %s", cid, str(e).split('\n')[0])
+
+                # res_partner: excluir los que aún son referenciados por tablas del sistema
+                try:
+                    cur.execute("""
+                        DELETE FROM res_partner
+                        WHERE company_id = %s
+                          AND id NOT IN (SELECT partner_id           FROM account_move    WHERE COALESCE(partner_id,0)!=0)
+                          AND id NOT IN (SELECT commercial_partner_id FROM account_move   WHERE COALESCE(commercial_partner_id,0)!=0)
+                          AND id NOT IN (SELECT partner_id           FROM res_users       WHERE COALESCE(partner_id,0)!=0)
+                          AND id NOT IN (SELECT partner_id           FROM purchase_order  WHERE COALESCE(partner_id,0)!=0)
+                          AND id NOT IN (SELECT partner_id           FROM sale_order      WHERE COALESCE(partner_id,0)!=0)
+                          AND id NOT IN (SELECT partner_id           FROM res_company     WHERE partner_id IS NOT NULL)
+                    """, (cid,))
+                    log.debug("res_partner limpiado (company_id=%s).", cid)
+                except Exception as e:
+                    self.tgt_conn.rollback()
+                    log.warning("No se pudo limpiar res_partner (company %s): %s", cid, str(e).split('\n')[0])
 
         log.info("Limpieza completada.")
 
@@ -279,19 +440,32 @@ class Migrator12to16:
             'city_id':              'res_city',
             'title':                'res_partner_title',
             'activity_description': 'sii_activity_description',
+            # user_id (vendedor asignado): los usuarios no se migran; se conserva
+            # el mismo uid solo si existe en destino (preload_id_map), si no NULL.
+            'user_id':              'res_users',
         }
         for fk, ref in ref_fks.items():
             if fk in src_cols:
-                # res_partner_title: preload por ID directo (suele coincidir)
-                if ref == 'res_partner_title':
+                # res_partner_title / res_users: preload por ID directo (suele coincidir)
+                if ref in ('res_partner_title', 'res_users'):
                     self.base.preload_id_map(ref)
                 mapping[fk] = ref
+
+        # tz: algunos nombres de huso horario "legacy" (alias retro-compatibles
+        # de la tzdata) no son reconocidos por el pytz del destino y rompen la
+        # ficha del contacto/usuario (ValueError al leer res.users.tz). Se
+        # normalizan a su nombre IANA canónico vigente.
+        TZ_ALIASES = {
+            'Chile/Continental': 'America/Santiago',
+            'America/Buenos_Aires': 'America/Argentina/Buenos_Aires',
+        }
 
         self.base.migrate_table(
             'res_partner',
             is_recursive=True,
             mapping_fields=mapping,
             skip_fields=['message_main_attachment_id', 'category_id'],
+            field_transforms={'tz': lambda v: TZ_ALIASES.get(v, v)},
         )
 
     def _map_sii_activity_description(self):
@@ -334,6 +508,119 @@ class Migrator12to16:
         log.info("sii_activity_description: %d/%d registros mapeados.", matched, len(src_rows))
 
     # ──────────────────────────────────────────────
+    # Corrección post-migración: partners de empresa
+    # ──────────────────────────────────────────────
+
+    def fix_company_partner_names(self):
+        """
+        Corrige partners de empresa que tienen name=NULL/vacío después de la migración.
+
+        Causa del error en producción:
+            l10n_cl_fe._acortar_str() invoca len(self.company_id.partner_id.name)
+            donde `name` es False porque el ORM de Odoo retorna False para campos
+            Char con valor NULL en BD → TypeError: object of type 'bool' has no len()
+
+        Este método detecta y corrige dos situaciones:
+          1. res_company.partner_id apunta a un partner cuyo name es NULL/vacío.
+             → UPDATE res_partner.name = company.name
+          2. res_company.partner_id es NULL (empresa sin partner vinculado).
+             → Vincula un partner existente por nombre o crea uno mínimo.
+        """
+        log.info("=== fix_company_partner_names: corrigiendo partners de empresa ===")
+        fixed = 0
+
+        with self.tgt_conn.cursor() as cur:
+
+            # ── Caso 1: partner vinculado pero con name NULL / vacío / literal 'false' ──
+            cur.execute("""
+                SELECT rc.id   AS company_id,
+                       rc.name AS company_name,
+                       rc.partner_id
+                FROM   res_company rc
+                JOIN   res_partner rp ON rp.id = rc.partner_id
+                WHERE  rp.name IS NULL
+                   OR  rp.name = ''
+                   OR  LOWER(rp.name) = 'false'
+            """)
+            rows = cur.fetchall()
+
+            for company_id, company_name, partner_id in rows:
+                if not company_name or str(company_name).lower() == 'false':
+                    company_name = f'Empresa {company_id}'
+                cur.execute(
+                    "UPDATE res_partner SET name = %s WHERE id = %s",
+                    (company_name, partner_id),
+                )
+                log.warning(
+                    "fix_company_partner_names [caso 1]: "
+                    "partner_id=%s -> name='%s' (company_id=%s)",
+                    partner_id, company_name, company_id,
+                )
+                fixed += 1
+
+            # ── Caso 2: empresa sin partner_id ──────────────────────────────────────
+            cur.execute(
+                "SELECT id, name FROM res_company WHERE partner_id IS NULL"
+            )
+            orphans = cur.fetchall()
+
+            for company_id, company_name in orphans:
+                if not company_name or str(company_name).lower() == 'false':
+                    company_name = f'Empresa {company_id}'
+
+                # Intentar reutilizar un partner sin empresa con el mismo nombre
+                cur.execute(
+                    "SELECT id FROM res_partner "
+                    "WHERE name = %s AND company_id IS NULL "
+                    "LIMIT 1",
+                    (company_name,),
+                )
+                existing = cur.fetchone()
+
+                if existing:
+                    partner_id = existing[0]
+                    cur.execute(
+                        "UPDATE res_company SET partner_id = %s WHERE id = %s",
+                        (partner_id, company_id),
+                    )
+                    log.warning(
+                        "fix_company_partner_names [caso 2a]: "
+                        "company_id=%s vinculada a partner_id=%s existente",
+                        company_id, partner_id,
+                    )
+                else:
+                    # Crear partner mínimo para la empresa
+                    # Nota: company_type es campo computado en Odoo 16, no se almacena
+                    cur.execute(
+                        """INSERT INTO res_partner
+                               (name, is_company, active,
+                                create_uid, write_uid)
+                           VALUES (%s, TRUE, TRUE, 1, 1)
+                           RETURNING id""",
+                        (company_name,),
+                    )
+                    partner_id = cur.fetchone()[0]
+                    cur.execute(
+                        "UPDATE res_company SET partner_id = %s WHERE id = %s",
+                        (partner_id, company_id),
+                    )
+                    log.warning(
+                        "fix_company_partner_names [caso 2b]: "
+                        "company_id=%s -> partner_id=%s creado nuevo (name='%s')",
+                        company_id, partner_id, company_name,
+                    )
+                fixed += 1
+
+        self.tgt_conn.commit()
+        if fixed:
+            log.warning(
+                "fix_company_partner_names: %d corrección(es) aplicadas. "
+                "Reinicia Odoo para que los caches se invaliden.", fixed
+            )
+        else:
+            log.info("fix_company_partner_names: todos los partners de empresa tienen name. OK.")
+
+    # ──────────────────────────────────────────────
     # Productos
     # ──────────────────────────────────────────────
 
@@ -344,12 +631,20 @@ class Migrator12to16:
         # UoM: mapear por nombre
         self._map_uom()
 
+        # Categorías POS (product_template.pos_categ_id): deben migrarse antes,
+        # si no toda fila con pos_categ_id NOT NULL viola la FK y se descarta entera.
+        self.base.migrate_table('pos_category', is_recursive=True)
+
         self.base.migrate_table(
             'product_template',
             mapping_fields={
                 'categ_id': 'product_category',
                 'uom_id': 'uom_uom',
                 'uom_po_id': 'uom_uom',
+                'pos_categ_id': 'pos_category',
+                # marca_id (method_minori): remapea la marca en productos recién insertados.
+                # Para productos ya existentes en destino actúa backfill_product_marca().
+                'marca_id': 'method_minori_marcas',
             },
             skip_fields=['message_main_attachment_id'],
         )
@@ -367,21 +662,58 @@ class Migrator12to16:
         )
 
     def _map_uom(self):
-        """Mapea uom_uom del origen al destino por nombre."""
+        """Mapea uom_uom del origen al destino por nombre (en_US, es_CL y normalizado)."""
+        import re as _re
         log.info("Mapeando unidades de medida (uom_uom)...")
         src_uoms = self.base.fetch_src("SELECT id, name FROM uom_uom")
         self.base.id_map.setdefault('uom_uom', {})
+
         with self.tgt_conn.cursor() as cur:
             cur.execute("SELECT id, name FROM uom_uom")
-            tgt_map = {}
+            tgt_en = {}   # en_US key -> id
+            tgt_es = {}   # es_CL key -> id
             for tid, name in cur.fetchall():
-                key = name if not isinstance(name, dict) else name.get('en_US', '')
-                tgt_map[key] = tid
+                if isinstance(name, dict):
+                    en = name.get('en_US', '').lower().strip()
+                    es = name.get('es_CL', '').lower().strip()
+                else:
+                    en = str(name).lower().strip()
+                    es = ''
+                if en:
+                    tgt_en[en] = tid
+                if es:
+                    tgt_es[es] = tid
+
+        def _try_match(key):
+            """Prueba variantes del key contra los mapas de destino."""
+            t = tgt_en.get(key) or tgt_es.get(key)
+            if t:
+                return t
+            # Strip trailing (s) / (es) / (ft) etc. y reintentar
+            norm = _re.sub(r'\([^)]*\)$', '', key).strip()
+            if norm != key:
+                t = tgt_en.get(norm) or tgt_es.get(norm)
+                if t:
+                    return t
+                # También prueba con 's' al final
+                t = tgt_en.get(norm + 's') or tgt_es.get(norm + 's')
+                if t:
+                    return t
+            return None
+
+        matched = 0
         for row in src_uoms:
-            src_name = row['name'] if not isinstance(row['name'], dict) else \
-                       row['name'].get('en_US', str(row['name']))
-            if src_name in tgt_map:
-                self.base.id_map['uom_uom'][row['id']] = tgt_map[src_name]
+            src_name = (row['name'] if not isinstance(row['name'], dict)
+                        else row['name'].get('en_US', str(row['name'])))
+            key = src_name.lower().strip()
+            tgt_id = _try_match(key)
+            if tgt_id:
+                self.base.id_map['uom_uom'][row['id']] = tgt_id
+                matched += 1
+            else:
+                log.warning("uom_uom '%s' (id=%s) sin match en destino.", src_name, row['id'])
+
+        log.info("uom_uom: %d/%d mapeadas.", matched, len(src_uoms))
 
     # ──────────────────────────────────────────────
     # Ventas
@@ -401,6 +733,10 @@ class Migrator12to16:
         """Migra purchase.order y purchase.order.line."""
         log.info("=== Migrando compras ===")
 
+        # user_id (comprador): los usuarios no se migran; se conserva el mismo
+        # uid solo si existe en destino, si no queda NULL (evita FK violation).
+        self.base.preload_id_map('res_users')
+
         self.base.migrate_table(
             'purchase_order',
             mapping_fields={
@@ -411,6 +747,7 @@ class Migrator12to16:
                 'currency_id': 'res_currency',
                 'fiscal_position_id': 'account_fiscal_position',
                 'payment_term_id': 'account_payment_term',
+                'user_id': 'res_users',
             },
             skip_fields=['message_main_attachment_id'],
         )
@@ -792,6 +1129,179 @@ class Migrator12to16:
 
         log.info("dte_caf: %d registros migrados.", inserted)
 
+    def fix_caf_folios(self):
+        """
+        Calcula y pobla los campos folio_actual y qty_available en la tabla dte_caf 
+        (que en Odoo 16 son requeridos y causan error si están nulos).
+        La lógica se basa en el number_next de la secuencia (ir_sequence) asociada.
+        """
+        log.info("=== Corrigiendo folios vacíos en dte_caf ===")
+        tgt_table = next(
+            (t for t in ('dte_caf', 'l10n_cl_dte_caf') if self.base.table_exists_in_tgt(t)), None
+        )
+        if not tgt_table:
+            log.warning("Tabla dte_caf no encontrada en destino.")
+            return
+
+        with self.tgt_conn.cursor() as cur:
+            # FIX DOCUMENT_CLASS_ID
+            # En Odoo 12, sii_document_class era el código real del SII (ej. 33, 61).
+            # En Odoo 16, document_class_id es un FK a sii_document_class (ID interno).
+            # Esto causa que los CAF queden asignados a clases equivocadas (ej ID 33 = Registro Mercadería).
+            # 1. Corregimos mediante la secuencia asociada (si existe).
+            cur.execute(f"""
+                UPDATE {tgt_table} c
+                SET document_class_id = jc.sii_document_class_id
+                FROM account_journal_sii_document_class jc
+                WHERE c.sequence_id = jc.sequence_id
+                  AND c.document_class_id != jc.sii_document_class_id
+            """)
+            docs_updated1 = cur.rowcount
+            # 2. Corregimos el resto asumiendo que el ID migrado es en realidad el sii_code
+            cur.execute(f"""
+                UPDATE {tgt_table} c
+                SET document_class_id = dc.id
+                FROM sii_document_class dc
+                WHERE c.document_class_id IN (33, 34, 39, 41, 46, 52, 56, 61, 110, 111, 112)
+                  AND dc.sii_code = c.document_class_id
+            """)
+            docs_updated2 = cur.rowcount
+            if docs_updated1 > 0 or docs_updated2 > 0:
+                log.info("Corregido document_class_id en %d registros de dte_caf (usando secuencia) y %d (fallback)", docs_updated1, docs_updated2)
+
+            # FIX COMPANY_ID
+            # Odoo 16 exige company_id explícito en dte_caf para hacer el match en _timbrar()
+            # Actualizamos company_id a partir de la secuencia (ir_sequence)
+            cur.execute(f"""
+                UPDATE {tgt_table} c
+                SET company_id = sq.company_id
+                FROM ir_sequence sq
+                WHERE sq.id = c.sequence_id
+                  AND c.company_id IS NULL
+                  AND sq.company_id IS NOT NULL
+            """)
+            company_updated = cur.rowcount
+            if company_updated > 0:
+                log.info("Corregido company_id nulo en %d registros de dte_caf (usando secuencia)", company_updated)
+
+            # Fallback a empresa principal (ID 1) si aún quedan en NULL, para evitar error de visibilidad
+            cur.execute(f"""
+                UPDATE {tgt_table}
+                SET company_id = 1
+                WHERE company_id IS NULL
+            """)
+            fallback_updated = cur.rowcount
+            if fallback_updated > 0:
+                log.info("Corregido company_id nulo en %d registros de dte_caf (fallback a 1)", fallback_updated)
+            
+            cur.execute(f"""
+                UPDATE {tgt_table} c
+                SET folio_actual = 
+                    CASE 
+                        WHEN s.number_next > c.final_nm THEN c.final_nm + 1
+                        WHEN s.number_next < c.start_nm THEN c.start_nm
+                        ELSE s.number_next
+                    END,
+                    qty_available = 
+                    CASE 
+                        WHEN s.number_next > c.final_nm THEN 0
+                        WHEN s.number_next < c.start_nm THEN c.final_nm - c.start_nm + 1
+                        ELSE c.final_nm - s.number_next + 1
+                    END
+                FROM ir_sequence s
+                WHERE c.sequence_id = s.id
+                  AND c.folio_actual IS NULL
+            """)
+            updated_with_seq = cur.rowcount
+
+            # Para los que no tienen secuencia o s.number_next es nulo, asumimos que no se han usado
+            cur.execute(f"""
+                UPDATE {tgt_table}
+                SET folio_actual = start_nm,
+                    qty_available = final_nm - start_nm + 1
+                WHERE folio_actual IS NULL
+            """)
+            updated_no_seq = cur.rowcount
+
+            # Actualizar estado a 'spent' si qty_available es <= 0 y está in_use
+            cur.execute(f"""
+                UPDATE {tgt_table}
+                SET state = 'spent'
+                WHERE qty_available <= 0 AND state = 'in_use'
+            """)
+            spent_updated = cur.rowcount
+
+            # WORKAROUND PARA BUG EN L10N_CL_FE DE ODOO 16:
+            # Los CAF en estado 'draft' tienen cantidad_folios = 0 por código Python,
+            # lo que provoca ZeroDivisionError en _used_level al cargar la vista lista.
+            # Pasamos los 'draft' a 'in_use' para evitar que se caiga la vista.
+            cur.execute(f"""
+                UPDATE {tgt_table}
+                SET state = 'in_use'
+                WHERE state = 'draft'
+            """)
+            draft_updated = cur.rowcount
+
+        self.tgt_conn.commit()
+        log.info("dte_caf folios corregidos: %d (con sec) + %d (sin sec). Pasados a 'spent': %d, 'draft'->'in_use': %d", 
+                 updated_with_seq, updated_no_seq, spent_updated, draft_updated)
+
+    def fix_caf_files(self):
+        """
+        En Odoo 16 el XML del CAF se lee desde el campo binario `caf_file`, el cual se almacena 
+        en la tabla `ir_attachment`. 
+        Este método toma el `caf_string` (XML en texto) copiado en la tabla dte_caf, 
+        lo codifica en base64 y genera el registro en ir_attachment para que Odoo lo reconozca.
+        """
+        log.info("=== Generando attachments para caf_file desde caf_string ===")
+        import base64
+        tgt_table = next(
+            (t for t in ('dte_caf', 'l10n_cl_dte_caf') if self.base.table_exists_in_tgt(t)), None
+        )
+        if not tgt_table:
+            log.warning("Tabla dte_caf no encontrada en destino.")
+            return
+
+        with self.tgt_conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(f"""
+                SELECT c.id, c.filename, c.caf_string, c.company_id 
+                FROM {tgt_table} c
+                LEFT JOIN ir_attachment a ON a.res_model = 'dte.caf' 
+                                         AND a.res_field = 'caf_file' 
+                                         AND a.res_id = c.id
+                WHERE c.caf_string IS NOT NULL 
+                  AND a.id IS NULL
+            """)
+            rows = cur.fetchall()
+
+        if not rows:
+            log.info("No hay CAFs pendientes de generar attachment.")
+            return
+
+        inserted = 0
+        with self.tgt_conn.cursor() as cur:
+            for row in rows:
+                xml_string = row['caf_string']
+                # Odoo 16 almacena los bytes en crudo en db_datas, el ORM es quien codifica a b64 al leer.
+                raw_data = xml_string.encode('utf-8')
+                
+                filename = row['filename'] or f"caf_{row['id']}.xml"
+                
+                cur.execute("""
+                    INSERT INTO ir_attachment (
+                        name, res_model, res_field, res_id, company_id, 
+                        type, db_datas, mimetype, create_date, write_date, create_uid, write_uid
+                    ) VALUES (
+                        %s, 'dte.caf', 'caf_file', %s, %s,
+                        'binary', %s, 'text/xml', NOW(), NOW(), 1, 1
+                    )
+                """, (filename, row['id'], row['company_id'], raw_data))
+                inserted += 1
+
+        self.tgt_conn.commit()
+        log.info("Attachments de caf_file creados: %d", inserted)
+
+
     def migrate_journal_sii_sequences_caf(self, journal_type: str = 'sale'):
         """
         Migra ir_sequence + dte_caf SOLO para el diario de Facturas de Clientes
@@ -955,6 +1465,10 @@ class Migrator12to16:
             with self.tgt_conn.cursor() as cur:
                 for row in caf_rows:
                     old_id = row['id']
+                    # Ya migrado por migrate_dte_caf() — solo actualizar id_map si falta
+                    if old_id in self.base.id_map.get(caf_src, {}):
+                        caf_inserted += 1
+                        continue
                     rec = {}
                     for col in src_caf_cols:
                         if col in skip_caf or col not in tgt_caf_cols:
@@ -1028,7 +1542,6 @@ class Migrator12to16:
                         "saltando account_journal_sii_document_class.", src_journal_id)
             return
 
-        src_jdc_cols = self.base.get_src_columns(SII_JDC_TABLE)
         tgt_jdc_cols = self.base.get_tgt_columns(SII_JDC_TABLE)
         doc_class_map = self.accounting._build_sii_doc_class_map()
 
@@ -1175,7 +1688,10 @@ class Migrator12to16:
             log.info("INICIO MIGRACIÓN Odoo 12 -> Odoo 16 Multiempresa")
             log.info("=" * 60)
 
-            # 0. Empresas
+            # 0a. Normalizar company_id de datos preexistentes
+            self.normalize_existing_company_id()
+
+            # 0b. Empresas
             self.setup_companies()
 
             # 1. Limpieza
@@ -1186,6 +1702,12 @@ class Migrator12to16:
 
             # 3. Contactos
             self.migrate_partners()
+            # 3b. Corrección: asegurar que todos los partners de empresa tengan name
+            #     (evita TypeError en l10n_cl_fe._acortar_str al validar facturas)
+            self.fix_company_partner_names()
+
+            # 3c. Usuarios (requiere id_map de res_partner ya cargado)
+            self.users.migrate_users()
 
             # 4. Plan de cuentas (con transformación de tipos)
             self.accounting.migrate_chart_of_accounts()
@@ -1208,6 +1730,9 @@ class Migrator12to16:
             # 9. Productos
             self.migrate_products()
 
+            # 9b. Modelos de method_minori (marcas, periodos, backfill marca_id)
+            self.method_minori.migrate_all()
+
             # 10. Ventas
             self.migrate_sales()
 
@@ -1224,12 +1749,16 @@ class Migrator12to16:
 
             # 12c. Reparaciones
             self.repair.migrate_all()
+            self.stock.update_moves_repair_id()  # 2do paso: vincula stock_move.repair_id
 
             # 12b. CAF, firma y secuencias SII localización chilena
             self.migrate_sii_firma()
             self.migrate_dte_caf()
             # Secuencias + CAF + account_journal_sii_document_class para Facturas de Clientes
             self.migrate_journal_sii_sequences_caf()
+            # Correcciones post-migración de CAF
+            self.fix_caf_folios()
+            self.fix_caf_files()
 
             # 13. Facturas (account_invoice -> account_move)
             self.accounting.migrate_invoices()

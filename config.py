@@ -7,7 +7,7 @@ Migración Odoo 12 -> Odoo 16 Multiempresa
 # CONFIGURACIÓN BASE DE DATOS ORIGEN (Odoo 12)
 # ─────────────────────────────────────────────
 SOURCE_DB = {
-    'dbname': 'servitk',
+    'dbname': 'bloom_2',
     'user': 'postgres',
     'password': '2010626Ab',
     'host': '168.232.165.138',
@@ -18,10 +18,12 @@ SOURCE_DB = {
 # CONFIGURACIÓN BASE DE DATOS DESTINO (Odoo 16)
 # ─────────────────────────────────────────────
 TARGET_DB = {
-    'dbname': 'clicksale',
-    'user': 'odoo',
-    'password': '2010',
-    'host': 'localhost',
+    'dbname': 'taller4',
+    'user': 'postgres',
+    'password': '2010626Ab',
+    # 'password': '2010',
+    'host': '64.176.21.191',
+    # 'host': 'localhost',
     'port': '5432',
 }
 
@@ -32,12 +34,20 @@ TARGET_DB = {
 # Formato: {'source_id': ID en Odoo 12, 'target_id': ID en Odoo 16 (0 = crear nueva)}
 # Si target_id = 0, la empresa se creará automáticamente en Odoo 16.
 COMPANY_MIGRATION = [
-    {'source_id': 1, 'target_id': 54, 'name': 'Empresa Principal'},
+    {'source_id': 1, 'target_id': 11, 'name': 'Empresa Principal'},
     # {'source_id': 2, 'target_id': 0, 'name': 'Sucursal Norte'},
 ]
 
 # Empresa fallback si no hay mapeo definido (para tablas sin company_id)
-DEFAULT_TARGET_COMPANY_ID = 54
+DEFAULT_TARGET_COMPANY_ID = 11
+
+# Empresa a la que deben quedar asignados TODOS los registros que ya
+# existían en destino antes de ejecutar la migración (normalización previa).
+EXISTING_DATA_COMPANY_ID = 1
+
+# IDs de res.users en ORIGEN que NO deben migrarse (ej. el administrador
+# que ya existe en destino con el mismo login).
+SKIP_SOURCE_USER_IDS = [2]
 
 # ─────────────────────────────────────────────
 # OPCIONES DE MIGRACIÓN
@@ -107,6 +117,8 @@ TABLES_TO_CLEAN = [
     'pos_order_line',
     'pos_order',
     'pos_session',
+    'pos_config',            # después de session/order (ambos la referencian)
+    'pos_payment_method',    # después de pos_payment y pos_config
     'purchase_order_line',
     'purchase_order',
     'sale_order_line',
@@ -127,8 +139,10 @@ TABLES_TO_CLEAN = [
     'l10n_cl_dte_caf',
     'sii_firma',
     'l10n_cl_certificate',
-    # 'account_tax_repartition_line',
-    # 'account_tax',
+    # SII: account_journal_sii_document_class debe ir ANTES de account_journal
+    'account_journal_sii_document_class',
+    'account_tax_repartition_line',  # FK a account_account y account_tax
+    'account_tax',
     'account_journal',
     'account_account',
     'account_payment_term',

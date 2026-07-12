@@ -3,12 +3,16 @@ run.py - Punto de entrada para la migración Odoo 12 -> Odoo 16 Multiempresa.
 
 Uso:
     python run.py
+    python run.py --step normalize_company  # Solo normalizar company_id de datos preexistentes
     python run.py --step companies       # Solo configurar empresas
     python run.py --step accounting      # Solo contabilidad
     python run.py --step stock           # Solo inventario
     python run.py --step pos             # Solo punto de venta
     python run.py --step sales           # Solo ventas
     python run.py --step purchases       # Solo compras
+    python run.py --step method_minori   # Solo marcas/periodos + backfill product.marca_id
+    python run.py --step fix_partners    # Corregir name=NULL en partners de empresa
+    python run.py --step fix_caf_folios  # Calcular folio_actual en dte_caf
     python run.py --dry-run              # Validar conexiones sin migrar
 
 Opciones avanzadas:
@@ -102,9 +106,9 @@ def check_connections(src_db, tgt_db):
             """)
             has_invoice = cur.fetchone()[0]
             if has_invoice:
-                log.info("  ✓ account_invoice encontrada en origen (confirma Odoo 12).")
+                log.info("  [OK] account_invoice encontrada en origen (confirma Odoo 12).")
             else:
-                log.error("  ✗ account_invoice NO encontrada. ¿Es realmente Odoo 12?")
+                log.error("  [FAIL] account_invoice NO encontrada. Es realmente Odoo 12?")
                 return False
         conn.close()
     except Exception as e:
@@ -112,6 +116,41 @@ def check_connections(src_db, tgt_db):
         return False
 
     return True
+
+
+def _preload_context(migrator: Migrator12to16, include_stock: bool = False):
+    """
+    Reconstruye id_maps esenciales para ejecutar un --step de forma aislada.
+    Llama a los mismos migrate_* que en una migración completa; los registros
+    ya existentes se mapean via UniqueViolation -> _find_existing.
+
+    include_stock=True añade ubicaciones/almacenes/tipos de operación
+    (necesario para sales/purchases/repair si stock ya fue migrado antes).
+    """
+    log = logging.getLogger('run')
+    log.info("Precargando contexto (id_maps desde BD destino)...")
+
+    migrator.setup_companies()
+    migrator.migrate_base_config()          # monedas, categorías, payment_terms
+    migrator.migrate_partners()             # contactos
+    migrator.migrate_products()             # productos
+    migrator.accounting.migrate_chart_of_accounts()
+    migrator.accounting.migrate_taxes()
+    migrator.accounting.migrate_journals()
+    migrator.migrate_sequences()
+
+    if include_stock:
+        migrator.stock.migrate_locations()
+        migrator.stock.migrate_warehouses()
+        migrator.stock.migrate_picking_types()
+        migrator.stock.migrate_routes()
+
+    # product_pricelist: requerido por pos_order.pricelist_id (NOT NULL) y por
+    # sale_order.pricelist_id; se precarga para que --step pos/sales/purchases
+    # funcionen de forma aislada sin depender de que 'sales' ya haya corrido.
+    migrator.sales._map_pricelist()
+
+    log.info("Contexto precargado.")
 
 
 def run_full(migrator: Migrator12to16):
@@ -122,8 +161,26 @@ def run_step(migrator: Migrator12to16, step: str):
     log = logging.getLogger('run')
     log.info("Ejecutando paso: %s", step)
 
-    if step == 'companies':
+    if step == 'normalize_company':
+        migrator.normalize_existing_company_id()
+        return  # No actualizar secuencias; no es necesario para este fix
+    elif step == 'companies':
         migrator.setup_companies()
+    elif step == 'partners':
+        migrator.setup_companies()
+        migrator.migrate_partners()
+        migrator.fix_company_partner_names()
+    elif step == 'users':
+        migrator.setup_companies()
+        migrator.migrate_partners()
+        migrator.users.migrate_users()
+    elif step == 'products':
+        migrator.migrate_base_config()   # necesario para id_map de product_category
+        migrator.migrate_products()
+    elif step == 'method_minori':
+        migrator.migrate_base_config()   # necesario para id_map de product_category
+        migrator.migrate_products()      # necesario para id_map de product_template (backfill)
+        migrator.method_minori.migrate_all()
     elif step == 'accounting':
         migrator.migrate_base_config()
         migrator.accounting.migrate_chart_of_accounts()
@@ -145,6 +202,7 @@ def run_step(migrator: Migrator12to16, step: str):
         migrator.accounting.migrate_payments()
         migrator.accounting.post_migration_updates()
     elif step == 'stock':
+        _preload_context(migrator, include_stock=False)
         migrator.stock.migrate_locations()
         migrator.stock.migrate_warehouses()
         migrator.stock.migrate_picking_types()
@@ -157,6 +215,7 @@ def run_step(migrator: Migrator12to16, step: str):
             migrator.stock.migrate_quants()
         migrator.stock.post_migration_stock()
     elif step == 'pos':
+        _preload_context(migrator, include_stock=True)
         migrator.pos.migrate_payment_methods()
         migrator.pos.migrate_config()
         migrator.pos.migrate_sessions()
@@ -164,16 +223,18 @@ def run_step(migrator: Migrator12to16, step: str):
         migrator.pos.migrate_order_lines()
         migrator.pos.migrate_pos_payments()
     elif step == 'sales':
+        _preload_context(migrator, include_stock=True)
         migrator.sales.migrate_sales()
-        # Vinculación sale_order_line <-> invoice lines (si la contabilidad ya fue migrada)
         migrator.base.migrate_m2m(
             'sale_order_line_invoice_rel',
             'order_line_id', 'invoice_line_id',
             'sale_order_line', 'account_invoice_line'
         )
     elif step == 'purchases':
+        _preload_context(migrator, include_stock=True)
         migrator.migrate_purchases()
     elif step == 'repair':
+        _preload_context(migrator, include_stock=True)
         migrator.repair.migrate_all()
     elif step == 'journal_sii':
         migrator.migrate_journal_sii_sequences_caf()
@@ -181,6 +242,16 @@ def run_step(migrator: Migrator12to16, step: str):
         migrator.migrate_sii_firma()
     elif step == 'sequences_caf':
         migrator.migrate_sii_sequences_and_caf()
+    elif step == 'fix_partners':
+        # Corrige partners de empresa con name=NULL/vacío.
+        # Ejecutar sobre BD ya migrada sin re-correr todo el proceso.
+        migrator.setup_companies()   # necesario para company_mapping
+        migrator.fix_company_partner_names()
+        return  # No actualizar secuencias; no es necesario para este fix
+    elif step == 'fix_caf_folios':
+        migrator.fix_caf_folios()
+        migrator.fix_caf_files()
+        return
     else:
         log.error("Paso desconocido: %s", step)
         sys.exit(1)
@@ -198,8 +269,9 @@ def main():
     )
     parser.add_argument(
         '--step',
-        choices=['companies', 'accounting', 'stock', 'pos', 'sales', 'purchases',
-                 'sii_firma', 'sequences_caf', 'repair', 'journal_sii'],
+        choices=['normalize_company', 'companies', 'partners', 'users', 'products', 'method_minori',
+                 'accounting', 'stock', 'pos', 'sales', 'purchases', 'sii_firma', 'sequences_caf',
+                 'repair', 'journal_sii', 'fix_partners', 'fix_caf_folios'],
         help='Ejecutar solo un paso específico de la migración'
     )
     parser.add_argument(

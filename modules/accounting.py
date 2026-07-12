@@ -746,6 +746,7 @@ class AccountingMigrator:
             'id', 'invoice_id',           # se usa move_id ahora
             'statement_id', 'statement_line_id',  # bank statements differ
             'analytic_account_id',         # -> analytic_distribution (JSON)
+            'payment_id',                  # FK a account_payment; se actualiza en post_migration_updates() tras migrate_payments()
         }
 
         cols_to_copy = [c for c in tgt_cols if c != 'id' and c in src_cols and c not in skip_src]
@@ -1109,7 +1110,15 @@ class AccountingMigrator:
         src_cols = self.b.get_src_columns('account_payment')
         tgt_cols = self.b.get_tgt_columns('account_payment')
 
-        payments = self.b.fetch_src("SELECT * FROM account_payment ORDER BY id")
+        payments = self.b.fetch_src("""
+            SELECT p.*,
+                   (SELECT DISTINCT aml.move_id
+                    FROM account_move_line aml
+                    WHERE aml.payment_id = p.id
+                    LIMIT 1) AS old_move_id
+            FROM account_payment p
+            ORDER BY p.id
+        """)
         self.b.id_map.setdefault('account_payment', {})
 
         # Campos comunes entre v12 y v16
@@ -1129,7 +1138,8 @@ class AccountingMigrator:
                     if fld in src_cols and fld in tgt_cols:
                         rec[fld] = pmt.get(fld)
 
-                rec['company_id'] = self.b.map_company(pmt.get('company_id'))
+                if 'company_id' in tgt_cols:
+                    rec['company_id'] = self.b.map_company(pmt.get('company_id'))
                 rec['create_uid'] = 1
                 rec['write_uid'] = 1
 
@@ -1151,6 +1161,13 @@ class AccountingMigrator:
                 # Odoo 16: date field (antes era payment_date)
                 if 'date' in tgt_cols and 'payment_date' in src_cols:
                     rec['date'] = pmt.get('payment_date')
+
+                # Obtener el move_id migrado
+                old_move_id = pmt.get('old_move_id')
+                if old_move_id:
+                    new_move_id = self.b.id_map.get('account_move', {}).get(old_move_id)
+                    if new_move_id:
+                        rec['move_id'] = new_move_id
 
                 self.b._fill_not_null(rec, tgt_cols)
 
@@ -1186,35 +1203,14 @@ class AccountingMigrator:
         fr_map = self.b.id_map.get('account_full_reconcile', {})
 
         src_payments = self.b.fetch_src("""
-            SELECT id,
-                   (SELECT DISTINCT aml.move_id
-                    FROM account_move_line aml
-                    WHERE aml.payment_id = account_payment.id
-                    LIMIT 1) AS linked_move_id
+            SELECT id
             FROM account_payment
             WHERE id IN (
                 SELECT DISTINCT payment_id FROM account_move_line WHERE payment_id IS NOT NULL
             )
         """)
 
-        updated_moves = 0
         with self.b.tgt_conn.cursor() as cur:
-            # Vincular account_payment.move_id
-            for row in src_payments:
-                tgt_pay = payment_map.get(row['id'])
-                tgt_move = move_map.get(row['linked_move_id'])
-                if tgt_pay and tgt_move:
-                    try:
-                        cur.execute(
-                            "UPDATE account_payment SET move_id=%s WHERE id=%s",
-                            (tgt_move, tgt_pay)
-                        )
-                        updated_moves += 1
-                    except Exception as e:
-                        self.b.tgt_conn.rollback()
-                        log.warning("payment move_id link error: %s", e)
-
-            log.info("Pagos vinculados a moves: %d", updated_moves)
 
             # Actualizar payment_id en account_move_line
             src_aml_pay = self.b.fetch_src(

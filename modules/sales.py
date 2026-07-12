@@ -49,6 +49,10 @@ class SalesMigrator:
         # se pre-mapean los equipos existentes por nombre y se omiten el resto.
         self._premap_crm_teams()
 
+        # user_id (vendedor): los usuarios no se migran; se conserva el mismo
+        # uid solo si existe en destino, si no queda NULL (evita FK violation).
+        self.b.preload_id_map('res_users')
+
         # Pricelist_id: transform con fallback para evitar NOT NULL failure
         # Se excluye de mapping_fields para que field_transforms lo maneje solo
         pricelist_transform = (
@@ -72,6 +76,7 @@ class SalesMigrator:
                 'currency_id':          'res_currency',
                 # pricelist_id se maneja por field_transforms (con fallback)
                 'payment_term_id':      'account_payment_term',
+                'user_id':              'res_users',
             },
             skip_fields=['message_main_attachment_id'],
             field_transforms={

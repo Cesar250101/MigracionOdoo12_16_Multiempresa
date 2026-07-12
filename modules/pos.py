@@ -18,8 +18,9 @@ log = logging.getLogger(__name__)
 
 class PosMigrator:
 
-    def __init__(self, base):
+    def __init__(self, base, accounting=None):
         self.b = base
+        self.accounting = accounting
 
     def migrate_payment_methods(self):
         """
@@ -99,9 +100,80 @@ class PosMigrator:
 
         log.info("pos_payment_method: %d métodos procesados.", len(journals_src))
 
+    def _map_or_create_cash_rounding(self):
+        """
+        Mapea/crea account_cash_rounding por nombre. No tiene company_id en
+        destino (es config compartida entre empresas), por lo que se dedupa
+        por nombre en vez de insertar sin control (evita duplicados en reruns).
+        """
+        if not self.b.table_exists_in_src('account_cash_rounding') or \
+                not self.b.table_exists_in_tgt('account_cash_rounding'):
+            return
+
+        src_rows = self.b.fetch_src("SELECT * FROM account_cash_rounding ORDER BY id")
+        self.b.id_map.setdefault('account_cash_rounding', {})
+
+        src_cols = self.b.get_src_columns('account_cash_rounding')
+        tgt_cols = self.b.get_tgt_columns('account_cash_rounding')
+
+        with self.b.tgt_conn.cursor() as cur:
+            cur.execute("SELECT id, name FROM account_cash_rounding")
+            tgt_by_name = {}
+            for tid, tname in cur.fetchall():
+                key = (tname if isinstance(tname, str) else
+                       (tname.get('en_US', '') if isinstance(tname, dict) else str(tname))
+                       ).lower().strip()
+                tgt_by_name[key] = tid
+
+        common = [c for c in src_cols if c in tgt_cols and c not in
+                  ('id', 'account_id', 'loss_account_id', 'create_uid', 'write_uid',
+                   'create_date', 'write_date')]
+
+        inserted = 0
+        with self.b.tgt_conn.cursor() as cur:
+            for row in src_rows:
+                old_id = row['id']
+                name = (row.get('name') or '').strip()
+                key = name.lower()
+
+                if key and key in tgt_by_name:
+                    self.b.id_map['account_cash_rounding'][old_id] = tgt_by_name[key]
+                    continue
+
+                rec = {c: row[c] for c in common}
+                rec['create_uid'] = 1
+                rec['write_uid'] = 1
+                self.b._fill_not_null(rec, tgt_cols)
+
+                cols_q = ', '.join(f'"{c}"' for c in rec)
+                placeholders = ', '.join(['%s'] * len(rec))
+                try:
+                    cur.execute(
+                        f'INSERT INTO account_cash_rounding ({cols_q}) VALUES ({placeholders}) RETURNING id',
+                        self.b.prepare_vals(rec, tgt_cols),
+                    )
+                    new_id = cur.fetchone()[0]
+                    self.b.id_map['account_cash_rounding'][old_id] = new_id
+                    if key:
+                        tgt_by_name[key] = new_id
+                    inserted += 1
+                except Exception as e:
+                    self.b.tgt_conn.rollback()
+                    log.error("account_cash_rounding old_id=%s: %s", old_id, e)
+
+        log.info("account_cash_rounding: %d creadas, %d mapeadas(existentes).",
+                  inserted, len(src_rows) - inserted)
+
     def migrate_config(self):
         """Migra pos_config."""
         log.info("Migrando configuración POS (pos_config)...")
+
+        # rounding_method: FK a account.cash.rounding. Existe desde Odoo 12 pero
+        # nunca se migraba la tabla, por lo que la FK quedaba huérfana y toda la
+        # fila de pos_config (y en cascada sesiones/órdenes) se descartaba.
+        # No tiene company_id en destino (config compartida): se dedupa por nombre
+        # para no crear duplicados en reintentos/reruns.
+        self._map_or_create_cash_rounding()
 
         skip_fields = [
             'journal_ids',            # -> payment_method_ids en Odoo 16
@@ -109,16 +181,31 @@ class PosMigrator:
             'message_main_attachment_id',
         ]
 
+        # group_pos_manager_id / group_pos_user_id: res.groups no se migra;
+        # se conserva el mismo id solo si existe en destino, si no queda NULL.
+        self.b.preload_id_map('res_groups')
+
         self.b.migrate_table(
             'pos_config',
             mapping_fields={
                 'picking_type_id': 'stock_picking_type',
-                'company_id': None,   # Manejado por map_company
                 'default_partner_id': 'res_partner',
                 'invoice_journal_id': 'account_journal',
                 'sequence_id': 'ir_sequence',
                 'sequence_line_id': 'ir_sequence',
                 'warehouse_id': 'stock_warehouse',
+                'rounding_method': 'account_cash_rounding',
+                # Campos SII/custom presentes en algunos esquemas destino
+                # (ej. VPS) pero no en todos; si no aplican, mapping_fields
+                # simplemente no los toca (no están en la fila).
+                'iface_start_categ_id': 'pos_category',
+                'group_pos_manager_id': 'res_groups',
+                'group_pos_user_id': 'res_groups',
+                'tip_product_id': 'product_product',
+                'default_fiscal_position_id': 'account_fiscal_position',
+                'crm_team_id': 'crm_team',
+                'secuencia_boleta': 'ir_sequence',
+                'secuencia_boleta_exenta': 'ir_sequence',
             },
             skip_fields=skip_fields,
         )
@@ -153,6 +240,17 @@ class PosMigrator:
             f"SELECT {config_col} AS config_id, journal_id FROM pos_config_journal_rel"
         )
 
+        # Detectar el nombre real de la columna de payment_method en destino
+        # (varía según versión: payment_method_id / pos_payment_method_id).
+        tgt_rel_cols = self.b.get_tgt_columns(rel_table_tgt)
+        pm_col = next(
+            (c for c in ('payment_method_id', 'pos_payment_method_id') if c in tgt_rel_cols),
+            None,
+        )
+        if not pm_col:
+            log.warning("No se encontró columna de payment_method en %s.", rel_table_tgt)
+            return
+
         inserted = 0
         with self.b.tgt_conn.cursor() as cur:
             for rel in relations:
@@ -161,9 +259,19 @@ class PosMigrator:
                 if not new_config or not new_pm:
                     continue
                 try:
+                    # No hay constraint única en (pos_config_id, payment_method_id) en
+                    # este esquema, así que "ON CONFLICT DO NOTHING" fallaría (no
+                    # matching unique constraint); se verifica existencia manualmente.
                     cur.execute(
-                        f'INSERT INTO {rel_table_tgt} (pos_config_id, payment_method_id) '
-                        f'VALUES (%s, %s) ON CONFLICT DO NOTHING',
+                        f'SELECT 1 FROM {rel_table_tgt} '
+                        f'WHERE pos_config_id=%s AND "{pm_col}"=%s',
+                        (new_config, new_pm)
+                    )
+                    if cur.fetchone():
+                        continue
+                    cur.execute(
+                        f'INSERT INTO {rel_table_tgt} (pos_config_id, "{pm_col}") '
+                        f'VALUES (%s, %s)',
                         (new_config, new_pm)
                     )
                     inserted += 1
@@ -197,22 +305,27 @@ class PosMigrator:
                 old_id = s['id']
                 rec = {c: s[c] for c in cols_copy if c in s}
 
-                rec['company_id'] = self.b.map_company(s.get('company_id'))
+                # company_id no existe en este esquema de pos_session (se deriva
+                # de config_id); solo se fuerza si la columna existe realmente.
+                if 'company_id' in tgt_cols:
+                    rec['company_id'] = self.b.map_company(s.get('company_id'))
                 rec['create_uid'] = 1
                 rec['write_uid'] = 1
 
                 for fk, ref in [
                     ('config_id', 'pos_config'),
-                    ('user_id', None),  # res_users - usar admin
+                    ('user_id', 'res_users'),
                     ('cash_journal_id', 'account_journal'),
                     ('cash_control_difference_id', 'account_account'),
+                    ('secuencia_boleta', 'ir_sequence'),
+                    ('secuencia_boleta_exenta', 'ir_sequence'),
                     ('sequence_number', None),
                 ]:
                     if fk in rec:
                         if ref and rec[fk]:
                             rec[fk] = self.b.id_map.get(ref, {}).get(rec[fk])
-                        elif fk == 'user_id':
-                            rec[fk] = 1  # Admin
+                        if fk == 'user_id' and not rec[fk]:
+                            rec[fk] = 1  # Admin (fallback si no hay uid mapeado)
 
                 for f in list(rec.keys()):
                     if f.endswith('_id') and rec.get(f) == 0:
@@ -239,6 +352,17 @@ class PosMigrator:
     def migrate_orders(self):
         """Migra pos_order."""
         log.info("Migrando órdenes POS (pos_order)...")
+
+        # user_id / responsable_envio (usuarios): los usuarios no se migran; se
+        # conserva el mismo uid solo si existe en destino, si no queda NULL.
+        self.b.preload_id_map('res_users')
+
+        # document_class_id (localización SII): mapear por código, igual que
+        # account_invoice.document_class_id en AccountingMigrator.
+        if self.accounting is not None:
+            doc_class_map = self.accounting._build_sii_doc_class_map()
+            self.b.id_map.setdefault('sii_document_class', {}).update(doc_class_map)
+
         self.b.migrate_table(
             'pos_order',
             mapping_fields={
@@ -247,9 +371,15 @@ class PosMigrator:
                 'config_id': 'pos_config',
                 'picking_id': 'stock_picking',
                 'invoice_id': 'account_move',    # account_invoice en v12 -> account_move en v16
+                'account_move': 'account_move',  # campo custom SII, distinto de invoice_id
                 'currency_id': 'res_currency',
                 'fiscal_position_id': 'account_fiscal_position',
                 'sale_journal': 'account_journal',
+                'user_id': 'res_users',
+                'responsable_envio': 'res_users',
+                'pricelist_id': 'product_pricelist',
+                'document_class_id': 'sii_document_class',
+                'sii_xml_request': None,  # sii_xml_envio no se migra: se anula
             },
             skip_fields=[
                 'statement_ids',
@@ -317,22 +447,40 @@ class PosMigrator:
         else:
             # Fallback: buscar por pos_order_id si existe el campo
             src_bsl_cols = self.b.get_src_columns('account_bank_statement_line')
-            if 'pos_order_id' not in src_bsl_cols:
-                log.warning("No se puede vincular pagos POS con órdenes. Saltando.")
-                return
-            payments = self.b.fetch_src("""
-                SELECT
-                    bsl.id          AS old_id,
-                    bsl.pos_order_id AS order_id,
-                    bsl.amount,
-                    bsl.date,
-                    bsl.name,
-                    bs.journal_id
-                FROM account_bank_statement_line bsl
-                JOIN account_bank_statement bs ON bs.id = bsl.statement_id
-                WHERE bsl.pos_order_id IS NOT NULL
-                ORDER BY bsl.id
-            """)
+            if 'pos_order_id' in src_bsl_cols:
+                payments = self.b.fetch_src("""
+                    SELECT
+                        bsl.id          AS old_id,
+                        bsl.pos_order_id AS order_id,
+                        bsl.amount,
+                        bsl.date,
+                        bsl.name,
+                        bs.journal_id
+                    FROM account_bank_statement_line bsl
+                    JOIN account_bank_statement bs ON bs.id = bsl.statement_id
+                    WHERE bsl.pos_order_id IS NOT NULL
+                    ORDER BY bsl.id
+                """)
+            else:
+                # Último recurso: esta instalación no tiene FK ni tabla M2M entre
+                # pos_order y account_bank_statement_line. En la práctica bsl.name
+                # es "<pos_order.name>: " (ej. "Shop/8762: "), así que se vinculan
+                # por coincidencia exacta de ese patrón de nombre.
+                log.info("Sin FK/M2M pos_order<->bank_statement_line; "
+                         "vinculando pagos POS por coincidencia de nombre.")
+                payments = self.b.fetch_src("""
+                    SELECT
+                        bsl.id          AS old_id,
+                        po.id           AS order_id,
+                        bsl.amount,
+                        bsl.date,
+                        bsl.name,
+                        bs.journal_id
+                    FROM account_bank_statement_line bsl
+                    JOIN account_bank_statement bs ON bs.id = bsl.statement_id
+                    JOIN pos_order po ON bsl.name = po.name || ': '
+                    ORDER BY bsl.id
+                """)
 
         tgt_pay_cols = self.b.get_tgt_columns('pos_payment')
         inserted = 0

@@ -116,6 +116,10 @@ class RepairMigrator:
         # Pre-cargar hr.employee: mapeo directo por ID (empleados ya configurados en destino)
         self.b.preload_id_map('hr_employee')
 
+        # Pre-cargar res.users: los usuarios no se migran; se conserva el mismo
+        # uid solo si existe en destino, si no queda NULL (evita FK violation).
+        self.b.preload_id_map('res_users')
+
         rows = self.b.fetch_src("SELECT * FROM repair_order ORDER BY id")
         self.b.id_map.setdefault('repair_order', {})
 
@@ -161,15 +165,12 @@ class RepairMigrator:
                     ('pricelist_id',        'product_pricelist'),
                     ('currency_id',         'res_currency'),
                     ('employee_id',         'hr_employee'),
-                    ('user_id',             None),   # mantener uid si coincide o poner None
+                    ('user_id',             'res_users'),
                 ]
                 for fk, ref in _fk_map:
                     if fk in rec:
                         val = row.get(fk)
-                        if val and ref:
-                            rec[fk] = self.b.id_map.get(ref, {}).get(val)
-                        elif not ref:
-                            rec[fk] = val  # uid: dejar tal cual (suele coincidir admin=1)
+                        rec[fk] = self.b.id_map.get(ref, {}).get(val) if val else None
 
                 # ── Estado ───────────────────────────────────────────
                 if 'state' in tgt_cols:

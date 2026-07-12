@@ -235,6 +235,21 @@ class StockMigrator:
     def migrate_pickings(self):
         """Migra stock_picking (entregas, recepciones, transferencias)."""
         log.info("Migrando albaranes (stock_picking)...")
+
+        # user_id (responsable): los usuarios no se migran; se conserva el mismo
+        # uid solo si existe en destino, si no queda NULL (evita FK violation).
+        self.b.preload_id_map('res_users')
+
+        # currency_id no existe en Odoo 12 stock_picking (campo relacionado no almacenado).
+        # En destinos donde el módulo que agrega la columna está instalado, Odoo 16 la
+        # requiere NOT NULL; inyectamos el default solo si la columna existe realmente.
+        extra_defaults = {}
+        if 'currency_id' in self.b.get_tgt_columns('stock_picking'):
+            with self.b.tgt_conn.cursor() as cur:
+                cur.execute("SELECT id FROM res_currency WHERE name='CLP' LIMIT 1")
+                row = cur.fetchone()
+                extra_defaults['currency_id'] = row[0] if row else None
+
         self.b.migrate_table(
             'stock_picking',
             mapping_fields={
@@ -246,9 +261,10 @@ class StockMigrator:
                 'sale_id': 'sale_order',
                 'purchase_id': 'purchase_order',
                 'backorder_id': 'stock_picking',
-                'currency_id': 'res_currency',
+                'user_id': 'res_users',
             },
             skip_fields=['message_main_attachment_id'],
+            extra_defaults=extra_defaults,
         )
 
     def migrate_moves(self):
@@ -275,6 +291,7 @@ class StockMigrator:
                 'created_production_id', 'unbuild_id', 'consume_unbuild_id',
                 'operation_id', 'workorder_id', 'bom_line_id', 'byproduct_id',
                 'order_finished_lot_id', 'message_main_attachment_id',
+                'repair_id',  # FK a repair_order; se vincula en update_moves_repair_id() tras repair.migrate_all()
             ],
         )
 
@@ -325,6 +342,18 @@ class StockMigrator:
                 for f in list(rec.keys()):
                     if f.endswith('_id') and rec[f] == 0:
                         rec[f] = None
+
+                # Fallback para product_uom_id (requerido en Odoo 16)
+                if not rec.get('product_uom_id') and rec.get('product_id'):
+                    # Intentar obtener uom_id del producto destino directamente
+                    try:
+                        with self.b.tgt_conn.cursor() as cur2:
+                            cur2.execute("SELECT uom_id FROM product_template pt JOIN product_product pp ON pp.product_tmpl_id = pt.id WHERE pp.id = %s", (rec['product_id'],))
+                            res = cur2.fetchone()
+                            if res:
+                                rec['product_uom_id'] = res[0]
+                    except Exception as e:
+                        self.b.tgt_conn.rollback()
 
                 self.b._fill_not_null(rec, tgt_cols)
 
@@ -513,3 +542,31 @@ class StockMigrator:
 
         # Actualizar return_picking_type_id (auto-referencia entre picking types)
         self._post_migrate_picking_type_returns()
+
+    def update_moves_repair_id(self):
+        """Segundo paso: vincula stock_move.repair_id tras migrate_all() de reparaciones."""
+        repair_map = self.b.id_map.get('repair_order', {})
+        if not repair_map:
+            log.info("stock_move.repair_id: sin mapa de reparaciones, saltando.")
+            return
+        move_map = self.b.id_map.get('stock_move', {})
+        src_moves = self.b.fetch_src(
+            "SELECT id, repair_id FROM stock_move WHERE repair_id IS NOT NULL"
+        )
+        updated = 0
+        with self.b.tgt_conn.cursor() as cur:
+            for row in src_moves:
+                new_repair_id = repair_map.get(row['repair_id'])
+                new_move_id = move_map.get(row['id'])
+                if new_repair_id and new_move_id:
+                    try:
+                        cur.execute(
+                            "UPDATE stock_move SET repair_id=%s WHERE id=%s",
+                            (new_repair_id, new_move_id)
+                        )
+                        updated += 1
+                    except Exception as e:
+                        self.b.tgt_conn.rollback()
+                        log.warning("stock_move repair_id update old_id=%s: %s", row['id'], e)
+            self.b.tgt_conn.commit()
+        log.info("stock_move.repair_id: %d movimientos vinculados a reparaciones.", updated)
