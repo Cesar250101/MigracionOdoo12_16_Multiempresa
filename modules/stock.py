@@ -141,24 +141,172 @@ class StockMigrator:
         log.info("stock_picking_type: %d return_picking_type_id actualizados.", updated)
 
     def migrate_routes(self):
-        """Migra rutas y reglas de abastecimiento."""
-        log.info("Migrando rutas (stock_route)...")
-        self.b.migrate_table('stock_route')
+        """
+        Migra rutas y reglas de abastecimiento.
+        Odoo 12: tabla stock_location_route (modelo stock.location.route)
+        Odoo 16: tabla stock_route          (modelo stock.route)
+        """
+        self._migrate_stock_routes()
+        self._migrate_stock_rules()
 
+    def _migrate_stock_routes(self):
+        """
+        Odoo 12: stock_location_route (modelo stock.location.route)
+        Odoo 16: stock_route          (modelo stock.route, mismos campos salvo
+                 el nombre de tabla/modelo).
+        """
+        log.info("Migrando rutas (stock_location_route -> stock_route)...")
+
+        if not self.b.table_exists_in_src('stock_location_route'):
+            log.warning("Tabla stock_location_route no encontrada en origen.")
+            return
+        if not self.b.table_exists_in_tgt('stock_route'):
+            log.warning("Tabla stock_route no encontrada en destino.")
+            return
+
+        tgt_cols = self.b.get_tgt_columns('stock_route')
+        routes = self.b.fetch_src("SELECT * FROM stock_location_route ORDER BY id")
+        self.b.id_map.setdefault('stock_route', {})
+
+        wh_map = self.b.id_map.get('stock_warehouse', {})
+
+        inserted = 0
+        mapped = 0
+        with self.b.tgt_conn.cursor() as cur:
+            for route in routes:
+                old_id = route['id']
+                rec = {
+                    'name': route['name'],
+                    'active': route.get('active', True),
+                    'sequence': route.get('sequence'),
+                    'product_selectable': route.get('product_selectable'),
+                    'product_categ_selectable': route.get('product_categ_selectable'),
+                    'warehouse_selectable': route.get('warehouse_selectable'),
+                    'sale_selectable': route.get('sale_selectable'),
+                    'supplied_wh_id': wh_map.get(route.get('supplied_wh_id')),
+                    'supplier_wh_id': wh_map.get(route.get('supplier_wh_id')),
+                    'company_id': self.b.map_company(route.get('company_id')),
+                    'create_uid': 1,
+                    'write_uid': 1,
+                }
+                self.b._fill_not_null(rec, tgt_cols)
+
+                cols_q = ', '.join(f'"{c}"' for c in rec)
+                placeholders = ', '.join(['%s'] * len(rec))
+                try:
+                    cur.execute(
+                        f'INSERT INTO stock_route ({cols_q}) VALUES ({placeholders}) RETURNING id',
+                        self.b.prepare_vals(rec, tgt_cols)
+                    )
+                    new_id = cur.fetchone()[0]
+                    self.b.id_map['stock_route'][old_id] = new_id
+                    inserted += 1
+                except Exception as e:
+                    self.b.tgt_conn.rollback()
+                    try:
+                        cur.execute(
+                            "SELECT id FROM stock_route WHERE name->>'en_US'=%s AND company_id=%s",
+                            (route['name'], rec['company_id'])
+                        )
+                        found = cur.fetchone()
+                        if found:
+                            self.b.id_map['stock_route'][old_id] = found[0]
+                            mapped += 1
+                        else:
+                            log.warning("stock_route old_id=%s (%s): %s",
+                                        old_id, route['name'], str(e).split('\n')[0])
+                    except Exception:
+                        self.b.tgt_conn.rollback()
+                        log.warning("stock_route old_id=%s (%s): %s",
+                                    old_id, route['name'], str(e).split('\n')[0])
+
+        log.info("stock_route: insertados=%d mapeados(existentes)=%d", inserted, mapped)
+
+    def _migrate_stock_rules(self):
+        """
+        Odoo 12: stock_rule.location_id     (destino de la regla)
+        Odoo 16: stock_rule.location_dest_id (mismo campo, renombrado).
+        Se migra manualmente porque migrate_table() no soporta renombrar
+        columnas entre origen y destino.
+        """
         log.info("Migrando reglas (stock_rule)...")
-        self.b.migrate_table(
-            'stock_rule',
-            mapping_fields={
-                'route_id': 'stock_route',
-                'location_src_id': 'stock_location',
-                'location_dest_id': 'stock_location',
-                'picking_type_id': 'stock_picking_type',
-                'warehouse_id': 'stock_warehouse',
-                'propagate_warehouse_id': 'stock_warehouse',
-                'group_id': 'procurement_group',
-                'partner_address_id': 'res_partner',
-            },
-        )
+
+        if not self.b.table_exists_in_src('stock_rule'):
+            log.warning("Tabla stock_rule no encontrada en origen.")
+            return
+
+        tgt_cols = self.b.get_tgt_columns('stock_rule')
+        rules = self.b.fetch_src("SELECT * FROM stock_rule ORDER BY id")
+        self.b.id_map.setdefault('stock_rule', {})
+
+        loc_map = self.b.id_map.get('stock_location', {})
+        route_map = self.b.id_map.get('stock_route', {})
+        pt_map = self.b.id_map.get('stock_picking_type', {})
+        wh_map = self.b.id_map.get('stock_warehouse', {})
+        group_map = self.b.id_map.get('procurement_group', {})
+        partner_map = self.b.id_map.get('res_partner', {})
+
+        inserted = 0
+        skipped = 0
+        with self.b.tgt_conn.cursor() as cur:
+            for rule in rules:
+                old_id = rule['id']
+
+                new_location_dest_id = loc_map.get(rule.get('location_id'))
+                new_route_id = route_map.get(rule.get('route_id'))
+                new_picking_type_id = pt_map.get(rule.get('picking_type_id'))
+
+                if not new_location_dest_id or not new_route_id or not new_picking_type_id:
+                    log.warning(
+                        "Saltando stock_rule old_id=%s (%s): FK requerida sin mapear "
+                        "(location_dest_id=%s, route_id=%s, picking_type_id=%s)",
+                        old_id, rule.get('name'),
+                        new_location_dest_id, new_route_id, new_picking_type_id
+                    )
+                    skipped += 1
+                    continue
+
+                rec = {
+                    'name': rule['name'],
+                    'active': rule.get('active', True),
+                    'group_propagation_option': rule.get('group_propagation_option'),
+                    'group_id': group_map.get(rule.get('group_id')),
+                    'action': rule.get('action'),
+                    'sequence': rule.get('sequence'),
+                    'company_id': self.b.map_company(rule.get('company_id')),
+                    'location_dest_id': new_location_dest_id,
+                    'location_src_id': loc_map.get(rule.get('location_src_id')),
+                    'route_id': new_route_id,
+                    'procure_method': rule.get('procure_method'),
+                    'route_sequence': rule.get('route_sequence'),
+                    'picking_type_id': new_picking_type_id,
+                    'delay': rule.get('delay'),
+                    'partner_address_id': partner_map.get(rule.get('partner_address_id')),
+                    'warehouse_id': wh_map.get(rule.get('warehouse_id')),
+                    'propagate_warehouse_id': wh_map.get(rule.get('propagate_warehouse_id')),
+                    'auto': rule.get('auto'),
+                    'create_uid': 1,
+                    'write_uid': 1,
+                }
+                self.b._fill_not_null(rec, tgt_cols)
+
+                cols_q = ', '.join(f'"{c}"' for c in rec)
+                placeholders = ', '.join(['%s'] * len(rec))
+                try:
+                    cur.execute(
+                        f'INSERT INTO stock_rule ({cols_q}) VALUES ({placeholders}) RETURNING id',
+                        self.b.prepare_vals(rec, tgt_cols)
+                    )
+                    new_id = cur.fetchone()[0]
+                    self.b.id_map['stock_rule'][old_id] = new_id
+                    inserted += 1
+                except Exception as e:
+                    self.b.tgt_conn.rollback()
+                    log.warning("stock_rule old_id=%s (%s): %s",
+                                old_id, rule.get('name'), str(e).split('\n')[0])
+                    skipped += 1
+
+        log.info("stock_rule: insertados=%d saltados=%d", inserted, skipped)
 
     def migrate_lots(self):
         """

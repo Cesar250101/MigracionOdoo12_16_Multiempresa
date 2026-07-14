@@ -135,19 +135,35 @@ class Migrator12to16:
             """)
             tables = [row[0] for row in cur.fetchall()]
 
+        keep_null_tables = getattr(cfg, 'NORMALIZE_KEEP_NULL_TABLES', set())
+
         updated_tables = 0
         total_rows = 0
         with self.tgt_conn.cursor() as cur:
             for table in tables:
                 try:
-                    cur.execute(
-                        f'UPDATE "{table}" SET company_id = %s '
-                        f'WHERE company_id IS DISTINCT FROM %s '
-                        f'  AND company_id IS DISTINCT FROM %s',
-                        (cfg.EXISTING_DATA_COMPANY_ID,
-                         cfg.EXISTING_DATA_COMPANY_ID,
-                         cfg.DEFAULT_TARGET_COMPANY_ID),
-                    )
+                    if table in keep_null_tables:
+                        # company_id=NULL es legítimo aquí (registro compartido
+                        # entre compañías): no lo tocamos, solo normalizamos
+                        # valores "sucios" que no sean NULL/1/11.
+                        cur.execute(
+                            f'UPDATE "{table}" SET company_id = %s '
+                            f'WHERE company_id IS NOT NULL '
+                            f'  AND company_id IS DISTINCT FROM %s '
+                            f'  AND company_id IS DISTINCT FROM %s',
+                            (cfg.EXISTING_DATA_COMPANY_ID,
+                             cfg.EXISTING_DATA_COMPANY_ID,
+                             cfg.DEFAULT_TARGET_COMPANY_ID),
+                        )
+                    else:
+                        cur.execute(
+                            f'UPDATE "{table}" SET company_id = %s '
+                            f'WHERE company_id IS DISTINCT FROM %s '
+                            f'  AND company_id IS DISTINCT FROM %s',
+                            (cfg.EXISTING_DATA_COMPANY_ID,
+                             cfg.EXISTING_DATA_COMPANY_ID,
+                             cfg.DEFAULT_TARGET_COMPANY_ID),
+                        )
                     if cur.rowcount:
                         updated_tables += 1
                         total_rows += cur.rowcount
@@ -198,22 +214,6 @@ class Migrator12to16:
                     self.tgt_conn.rollback()
                     log.warning("No se pudo limpiar %s: %s", fpa_table, str(e).split('\n')[0])
 
-            # --- Limpiar pos_session (no tiene company_id propio; se deriva de
-            # config_id -> pos_config.company_id) ANTES del loop genérico, que
-            # la saltaría silenciosamente por no tener esa columna. Sin esto,
-            # las sesiones quedan huérfanas entre corridas y chocan por
-            # "pos_session_uniq_name" (UNIQUE global sobre name) en el rerun.
-            try:
-                cur.execute(
-                    f'DELETE FROM pos_session WHERE config_id IN '
-                    f'(SELECT id FROM pos_config WHERE company_id IN ({placeholders}))',
-                    list(company_ids)
-                )
-                log.debug("Limpiado: pos_session (%d filas)", cur.rowcount)
-            except Exception as e:
-                self.tgt_conn.rollback()
-                log.warning("No se pudo limpiar pos_session: %s", str(e).split('\n')[0])
-
             # --- Limpiar account_payment (tampoco tiene company_id propio; se
             # deriva de move_id -> account_move.company_id). Debe ir antes de
             # que el loop genérico borre account_move, si no queda huérfano.
@@ -248,6 +248,26 @@ class Migrator12to16:
                         list(company_ids)
                     )
                     log.debug("Limpiado: %s", table)
+
+                    # pos_session no tiene company_id propio (se deriva de
+                    # config_id -> pos_config.company_id), así que el chequeo
+                    # de columna de arriba la saltearía siempre. Se limpia
+                    # aquí mismo, justo después de pos_order (ya sin filas
+                    # que la referencien) y antes de que el loop llegue a
+                    # pos_config (que la subquery todavía necesita viva).
+                    # Sin esto, las sesiones quedan huérfanas entre corridas
+                    # y chocan por "pos_session_uniq_name" en el rerun.
+                    if table == 'pos_order':
+                        try:
+                            cur.execute(
+                                f'DELETE FROM pos_session WHERE config_id IN '
+                                f'(SELECT id FROM pos_config WHERE company_id IN ({placeholders}))',
+                                list(company_ids)
+                            )
+                            log.debug("Limpiado: pos_session (%d filas)", cur.rowcount)
+                        except Exception as e:
+                            self.tgt_conn.rollback()
+                            log.warning("No se pudo limpiar pos_session: %s", str(e).split('\n')[0])
                 except Exception as e:
                     self.tgt_conn.rollback()
                     log.warning("No se pudo limpiar %s: %s", table, str(e).split('\n')[0])
@@ -635,6 +655,19 @@ class Migrator12to16:
         # si no toda fila con pos_categ_id NOT NULL viola la FK y se descarta entera.
         self.base.migrate_table('pos_category', is_recursive=True)
 
+        # Campos selection requeridos en v16 que NO existen en v12: si se dejan
+        # NULL, la vista de producto falla al grabar con "Campos no válidos"
+        # (service_tracking='Crear en el pedido', priority='Favorito').
+        #   service_tracking (sale_project): 'no' = no genera proyecto/tarea.
+        #   priority         (product):      '0' = prioridad normal.
+        # Solo se fuerzan si la columna existe en destino (service_tracking
+        # depende del módulo sale_project).
+        tmpl_tgt_cols = self.base.get_tgt_columns('product_template')
+        tmpl_defaults = {}
+        for col, default in (('service_tracking', 'no'), ('priority', '0')):
+            if col in tmpl_tgt_cols:
+                tmpl_defaults[col] = default
+
         self.base.migrate_table(
             'product_template',
             mapping_fields={
@@ -646,6 +679,7 @@ class Migrator12to16:
                 # Para productos ya existentes en destino actúa backfill_product_marca().
                 'marca_id': 'method_minori_marcas',
             },
+            extra_defaults=tmpl_defaults,
             skip_fields=['message_main_attachment_id'],
         )
 
@@ -655,10 +689,24 @@ class Migrator12to16:
             skip_fields=['message_main_attachment_id'],
         )
 
-        # Rutas de producto (M2M)
+        # Impuestos de producto (M2M). Sin estos, los productos migrados no
+        # tienen IVA y el POS chileno rechaza la boleta afecta con
+        # "Debe haber al menos un producto afecto". prod_id -> product.template.
+        # Requiere que migrate_taxes() ya haya corrido (id_map['account_tax']).
+        self.base.migrate_m2m(
+            'product_taxes_rel', 'prod_id', 'tax_id',
+            'product_template', 'account_tax'
+        )
+        self.base.migrate_m2m(
+            'product_supplier_taxes_rel', 'prod_id', 'tax_id',
+            'product_template', 'account_tax'
+        )
+
+        # Rutas de producto (M2M). stock_route_product.product_id referencia
+        # product.template (no product.product) tanto en v12 como en v16.
         self.base.migrate_m2m(
             'stock_route_product', 'product_id', 'route_id',
-            'product_product', 'stock_route'
+            'product_template', 'stock_route'
         )
 
     def _map_uom(self):

@@ -45,6 +45,14 @@ DEFAULT_TARGET_COMPANY_ID = 11
 # existían en destino antes de ejecutar la migración (normalización previa).
 EXISTING_DATA_COMPANY_ID = 1
 
+# Tablas donde company_id=NULL es un valor legítimo de Odoo (registro
+# "compartido" entre todas las compañías, ej. product.pricelist "Public
+# Pricelist") y por lo tanto NO debe forzarse a EXISTING_DATA_COMPANY_ID
+# durante la normalización. Solo se preservan los NULL; si la fila ya tiene
+# un company_id "sucio" (ni EXISTING_DATA_COMPANY_ID ni
+# DEFAULT_TARGET_COMPANY_ID), igual se normaliza a EXISTING_DATA_COMPANY_ID.
+NORMALIZE_KEEP_NULL_TABLES = {'product_pricelist'}
+
 # IDs de res.users en ORIGEN que NO deben migrarse (ej. el administrador
 # que ya existe en destino con el mismo login).
 SKIP_SOURCE_USER_IDS = [2]

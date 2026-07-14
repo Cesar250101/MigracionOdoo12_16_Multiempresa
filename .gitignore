@@ -5,3 +5,4 @@ __pycache__/
 migration.log
 *.log
 .env
+.claude/

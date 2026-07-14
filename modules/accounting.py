@@ -291,6 +291,24 @@ class AccountingMigrator:
 
                 self.tax_repr_map[old_id] = repr_ids
 
+        # real_amount es un campo calculado/almacenado (= amount * factor de las
+        # repartition lines de tipo 'tax'). Como insertamos impuestos y sus
+        # repartition lines por SQL directo (sin ORM), el compute nunca se
+        # dispara y real_amount queda NULL/0. El POS carga real_amount (no
+        # amount) para calcular impuestos: sin este recálculo, las boletas
+        # afectas fallan con "Debe haber al menos un producto afecto".
+        with self.b.tgt_conn.cursor() as cur:
+            cur.execute("""
+                UPDATE account_tax t
+                SET real_amount = t.amount * COALESCE((
+                    SELECT SUM(rl.factor_percent) / 100.0
+                    FROM account_tax_repartition_line rl
+                    WHERE rl.invoice_tax_id = t.id AND rl.repartition_type = 'tax'
+                ), 1.0)
+                WHERE t.id = ANY(%s)
+            """, (list(self.b.id_map.get('account_tax', {}).values()),))
+            log.info("account_tax: real_amount recalculado en %d impuestos.", cur.rowcount)
+
         log.info("account_tax: %d impuestos, %d repartition lines.", inserted_taxes, inserted_repr)
 
     # ──────────────────────────────────────────────
